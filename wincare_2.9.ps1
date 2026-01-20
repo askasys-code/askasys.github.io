@@ -2148,7 +2148,7 @@ if (-not (Test-Administrator)) {
     # Se $scriptPath è vuoto, significa che lo script sta girando in memoria (irm | iex)
     if ([string]::IsNullOrWhiteSpace($scriptPath)) {
         # Sostituisci questo URL se cambia in futuro
-        $RemoteUrl = "https://raw.githubusercontent.com/askasys-code/askasys.github.io/main/wincare_2.8.ps1"
+        $RemoteUrl = "https://raw.githubusercontent.com/askasys-code/askasys.github.io/main/wincare_2.9.ps1"
         Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -Command `"irm $RemoteUrl | iex`"" -Verb RunAs
     } 
     else {
@@ -2197,4 +2197,5 @@ do {
 } while ($selection -ne "0")
 
 Write-Host "Complete." -ForegroundColor Green
+
 #endregion
