@@ -1,4 +1,5 @@
-﻿# WinCare: Windows Maintenance Menu
+﻿
+# WinCare: Windows Maintenance Menu
 # Compatible with PowerShell 5.1
 # Author: askasys
 # Description: Menu-driven tool for Windows system integrity, cleanup, and configuration tasks.
