@@ -2025,6 +2025,7 @@ function Run-BrowserProfileBackup {
         [PSCustomObject]@{ Id=4; Name="Chromium";       Source="$LocalAppData\Chromium\User Data";                  ZipName="chromium_backup_$DateStamp.zip" }
         [PSCustomObject]@{ Id=5; Name="Mozilla Firefox";Source="$AppData\Mozilla\Firefox";                          ZipName="firefox_backup_$DateStamp.zip" }
         [PSCustomObject]@{ Id=6; Name="LibreWolf";      Source="$AppData\LibreWolf";                                ZipName="librewolf_backup_$DateStamp.zip" }
+        [PSCustomObject]@{ Id=7; Name="Cromite";        Source="$LocalAppData\Cromite";                             ZipName="cromite_backup_$DateStamp.zip" }
     )
 
     # --- INTERACTIVE MENU ---
