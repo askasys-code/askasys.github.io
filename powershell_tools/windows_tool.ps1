@@ -1,51 +1,40 @@
-﻿<#
-    .SYNOPSIS
-        Windows Tool
-
-    .DESCRIPTION
-        Keybinding Logic:
-        - [1-8]: Interface, Visuals & Context Menus.
-        - [9-0]: AI & Telemetry.
-        - [W/S/D]: Core Components (Winget, Store, Defender).
-        - [A,B,C,E,L]: App Manager.
-        - [R,N,I]: Runtimes & Frameworks.
-        - [X]: Exit.
-
-    .NOTES
-        REQUIRES: Administrator Privileges
-        COMPATIBILITY: PowerShell 5.1+
-        CODING STANDARD: All internal comments must be written in ENGLISH.
-#>
+﻿# REQUIRES: Administrator Privileges
+# COMPATIBILITY: PowerShell 5.1+
+# CODING STANDARD: All internal comments must be written in ENGLISH.
 
 # ---------------------------------------------------------------------------
-# INITIALIZATION
+# INITIALIZATION & SETUP
 # ---------------------------------------------------------------------------
+
+#region Setup, Encoding & Auto-Elevation
+# --- 1. GLOBAL SETTINGS ---
+# Set error preference
 $ErrorActionPreference = "SilentlyContinue"
+
+# Set Console Encoding to UTF-8
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
+# Enable modern security protocols (TLS 1.2 & 1.3)
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
 
-# Admin Check & Auto-Elevation
-function Test-Admin {
-    $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
-    return $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-}
-
-if (-not (Test-Admin)) {
+# --- 2. ADMIN SELF-ELEVATION ---
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Host "`n [!] Administrator privileges required." -ForegroundColor Yellow
     Write-Host " [!] Restarting as Administrator..." -ForegroundColor White
     
     $scriptPath = $MyInvocation.MyCommand.Definition
-    if ([string]::IsNullOrWhiteSpace($scriptPath)) {
-        Write-Host " [X] Error: Could not determine script path. Run as Admin manually." -ForegroundColor Red
-        Start-Sleep -Seconds 4; Exit
-    }
+
     try {
-        Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`"" -Verb RunAs
+        # Restart the process as Admin, maintaining the current working directory
+        Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`"" -Verb RunAs -WorkingDirectory $PSScriptRoot
         Exit
     } catch {
-        Write-Host " [X] Failed to auto-elevate." -ForegroundColor Red; Start-Sleep 4; Exit
+        # If the user clicks "No" on the UAC prompt
+        Write-Host " [X] Elevation failed or cancelled by user." -ForegroundColor Red
+        Exit
     }
 }
+#endregion
 
 # ---------------------------------------------------------------------------
 # HELPERS: STATUS CHECKS
@@ -232,14 +221,24 @@ function Install-Repair-Winget {
 }
 
 function Toggle-Store {
+    # EDITED: Improved LTSC Support
     if ((Get-ComponentStatus "Store").Text -match "INSTALLED") {
         Write-Host "   [-] Removing Microsoft Store..." -ForegroundColor Yellow
         Get-AppxPackage -AllUsers *WindowsStore* | Remove-AppxPackage -AllUsers
         Get-AppxPackage -AllUsers *StorePurchaseApp* | Remove-AppxPackage -AllUsers
+        Write-Host "   [OK] Microsoft Store removed." -ForegroundColor Green
     } else {
-        Write-Host "   [+] Restoring Microsoft Store..." -ForegroundColor Green
-        Get-AppxPackage -AllUsers *WindowsStore* | Foreach {Add-AppxPackage -DisableDevelopmentMode -Register "$($_.InstallLocation)\AppXManifest.xml"}
-        Start-Process "wsreset.exe" -NoNewWindow
+        Write-Host "   [+] Installing Microsoft Store (LTSC Method)..." -ForegroundColor Green
+        Write-Host "       Executing 'wsreset.exe -i' to download Store..." -ForegroundColor Cyan
+        
+        try {
+            # wsreset -i works on modern LTSC to pull Store from WU
+            Start-Process "wsreset.exe" -ArgumentList "-i" -NoNewWindow
+            Write-Host "   [!] Install command sent. The Store will appear in a few minutes." -ForegroundColor Yellow
+            Write-Host "       Requires active Internet connection." -ForegroundColor DarkGray
+        } catch {
+            Write-Host "   [X] Failed to execute wsreset: $($_.Exception.Message)" -ForegroundColor Red
+        }
     }
     Start-Sleep 2
 }
@@ -286,7 +285,7 @@ do {
     Write-Host "   CORE COMPONENTS & SECURITY" -ForegroundColor Gray
     Write-Host "   ----------------------------------------" -ForegroundColor DarkGray
     $s = Get-ComponentStatus "WinGet"; Write-Host "   [W] Install / Repair WinGet : " -NoNewline; Write-Host $s.Text -ForegroundColor $s.Color
-    $s = Get-ComponentStatus "Store"; Write-Host "   [S] Microsoft Store         : " -NoNewline; Write-Host $s.Text -ForegroundColor $s.Color
+    $s = Get-ComponentStatus "Store"; Write-Host "   [S] Microsoft Store (LTSC)  : " -NoNewline; Write-Host $s.Text -ForegroundColor $s.Color
     $s = Get-DefenderStatus; Write-Host "   [D] Windows Defender (RTP)  : " -NoNewline; Write-Host $s.Text -ForegroundColor $s.Color
 
     Write-Host ""
