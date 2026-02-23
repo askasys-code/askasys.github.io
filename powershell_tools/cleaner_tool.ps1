@@ -5,30 +5,33 @@
 # ---------------------------------------------------------------------------
 # INITIALIZATION & SETUP
 # ---------------------------------------------------------------------------
+
+#region Setup, Encoding & Auto-Elevation
+# --- 1. GLOBAL SETTINGS ---
+# Set error preference
 $ErrorActionPreference = "SilentlyContinue"
+
+# Set Console Encoding to UTF-8
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-#region Core: Admin Privileges Check
-function Test-Administrator {
-    $user = [Security.Principal.WindowsIdentity]::GetCurrent()
-    (New-Object Security.Principal.WindowsPrincipal($user)).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
-}
+# Enable modern security protocols (TLS 1.2 & 1.3)
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
 
-if (-not (Test-Administrator)) {
-    Write-Host "`n [!] Administrator privileges are required." -ForegroundColor Yellow
+# --- 2. ADMIN SELF-ELEVATION ---
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Host "`n [!] Administrator privileges required." -ForegroundColor Yellow
     Write-Host " [!] Restarting as Administrator..." -ForegroundColor White
     
     $scriptPath = $MyInvocation.MyCommand.Definition
-    if ([string]::IsNullOrWhiteSpace($scriptPath)) {
-        Write-Host " [X] Error: Could not determine script path." -ForegroundColor Red
-        Start-Sleep -Seconds 4; Exit
-    }
+
     try {
-        Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`"" -Verb RunAs
+        # Restart the process as Admin, maintaining the current working directory
+        Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`"" -Verb RunAs -WorkingDirectory $PSScriptRoot
         Exit
     } catch {
-        Write-Host " [X] Auto-elevation failed. Run as Admin manually." -ForegroundColor Red
-        Start-Sleep -Seconds 4; Exit
+        # If the user clicks "No" on the UAC prompt
+        Write-Host " [X] Elevation failed or cancelled by user." -ForegroundColor Red
+        Exit
     }
 }
 #endregion

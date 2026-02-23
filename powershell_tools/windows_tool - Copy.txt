@@ -2,12 +2,6 @@
 # COMPATIBILITY: PowerShell 5.1+ / Windows 11 IoT LTSC
 # CODING STANDARD: All internal comments must be written in ENGLISH.
 
-<#
-    Windows Tweaks & Optimization Tool
-    Updated: 2026-02-23
-    Description: General toolbox for UI, Context Menus, Apps, and CPU performance tweaks.
-#>
-
 # ---------------------------------------------------------------------------
 # INITIALIZATION & SETUP
 # ---------------------------------------------------------------------------
@@ -19,8 +13,7 @@ $ErrorActionPreference = "SilentlyContinue"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
 
 # --- 2. ADMIN SELF-ELEVATION ---
-$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if (-not $isAdmin) {
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Host "`n [!] Administrator privileges required." -ForegroundColor Yellow
     Write-Host " [!] Restarting as Administrator..." -ForegroundColor White
     
@@ -73,16 +66,6 @@ function Get-DefenderStatus {
     else { return @{ Text="DISABLED "; Color="Red" } }
 }
 
-function Get-MitigationStatus {
-    $path = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management"
-    $val = (Get-ItemProperty -Path $path -Name "FeatureSettingsOverride" -ErrorAction SilentlyContinue).FeatureSettingsOverride
-    
-    # 3 = Mitigations OFF (Fastest but vulnerable)
-    # 0 / null = Mitigations ON (Secure but slower)
-    if ($val -eq 3) { return @{ Text="DISABLED (FAST)  "; Color="Yellow" } } 
-    else { return @{ Text="ACTIVE (SECURE)  "; Color="Green" } }
-}
-
 function Get-ComponentStatus {
     param ([string]$Name)
     switch ($Name) {
@@ -91,7 +74,7 @@ function Get-ComponentStatus {
             return @{ Text="MISSING  "; Color="Red" }
         }
         "Store" {
-            if (Get-AppxPackage -Name "Microsoft.WindowsStore" -ErrorAction SilentlyContinue) { return @{ Text="INSTALLED"; Color="Green" } }
+            if (Get-AppxPackage -Name "Microsoft.WindowsStore") { return @{ Text="INSTALLED"; Color="Green" } }
             return @{ Text="MISSING  "; Color="Red" }
         }
         "DirectX" {
@@ -246,26 +229,6 @@ function Toggle-Defender {
     Start-Sleep 2
 }
 
-function Toggle-Mitigations {
-    $path = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management"
-    $val = (Get-ItemProperty -Path $path -Name "FeatureSettingsOverride" -ErrorAction SilentlyContinue).FeatureSettingsOverride
-    
-    # Val 3 means mitigations are disabled
-    if ($val -eq 3) {
-        Write-Host "   [+] Enabling Spectre/Meltdown Mitigations (Secure)..." -ForegroundColor Green
-        Set-ItemProperty -Path $path -Name "FeatureSettingsOverride" -Value 0 -Type DWord -Force
-        Set-ItemProperty -Path $path -Name "FeatureSettingsOverrideMask" -Value 3 -Type DWord -Force
-        Write-Host "   [OK] CPU Mitigations ENABLED." -ForegroundColor Green
-    } else {
-        Write-Host "   [-] Disabling Spectre/Meltdown Mitigations (Fast)..." -ForegroundColor Yellow
-        Set-ItemProperty -Path $path -Name "FeatureSettingsOverride" -Value 3 -Type DWord -Force
-        Set-ItemProperty -Path $path -Name "FeatureSettingsOverrideMask" -Value 3 -Type DWord -Force
-        Write-Host "   [OK] CPU Mitigations DISABLED. Older CPUs will perform faster." -ForegroundColor Yellow
-    }
-    Write-Host "   [!] A SYSTEM REBOOT IS REQUIRED to apply these changes." -ForegroundColor Cyan
-    Start-Sleep 3
-}
-
 function Install-Repair-Winget {
     if ((Get-ComponentStatus "WinGet").Text -match "INSTALLED") { Write-Host "   [!] WinGet is already installed. Attempting repair..." -ForegroundColor Yellow } 
     else { Write-Host "   [+] Installing/Repairing WinGet..." -ForegroundColor Green }
@@ -285,8 +248,8 @@ function Install-Repair-Winget {
 function Toggle-Store {
     if ((Get-ComponentStatus "Store").Text -match "INSTALLED") {
         Write-Host "   [-] Removing Microsoft Store..." -ForegroundColor Yellow
-        Get-AppxPackage -AllUsers *WindowsStore* -ErrorAction SilentlyContinue | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
-        Get-AppxPackage -AllUsers *StorePurchaseApp* -ErrorAction SilentlyContinue | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
+        Get-AppxPackage -AllUsers *WindowsStore* | Remove-AppxPackage -AllUsers
+        Get-AppxPackage -AllUsers *StorePurchaseApp* | Remove-AppxPackage -AllUsers
         Write-Host "   [OK] Microsoft Store removed." -ForegroundColor Green
     } else {
         Write-Host "   [+] Installing Microsoft Store (LTSC Method)..." -ForegroundColor Green
@@ -308,19 +271,15 @@ function Toggle-Store {
 
 do {
     Clear-Host
-    Write-Host "   ========================================" -ForegroundColor Cyan
-    Write-Host "          WINDOWS LTSC & TWEAK TOOL        " -ForegroundColor White
-    Write-Host "   ========================================" -ForegroundColor Cyan
+    Write-Host "   ==============================" -ForegroundColor Cyan
+    Write-Host "           WINDOWS TOOL          " -ForegroundColor White
+    Write-Host "   ==============================" -ForegroundColor Cyan
 
     # --- PERFORMANCE OPTIMIZATION: Cache the installed apps list ---
     $installedAppsCache = @{}
-    $uninstallPaths = @(
-        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall", 
-        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
-        "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall" # Included for user-level installs
-    )
+    $uninstallPaths = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall", "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
     foreach ($path in $uninstallPaths) {
-        Get-ChildItem -Path $path -ErrorAction SilentlyContinue | ForEach-Object { 
+        Get-ChildItem -Path $path | ForEach-Object { 
             $displayName = $_.GetValue("DisplayName")
             if ($displayName) { $installedAppsCache[$displayName] = $true }
         }
@@ -350,13 +309,12 @@ do {
     $s = Get-ComponentStatus "WinGet"; Write-Host "   [W] Install / Repair WinGet   : " -NoNewline; Write-Host $s.Text -ForegroundColor $s.Color
     $s = Get-ComponentStatus "Store"; Write-Host "   [S] Microsoft Store (LTSC)    : " -NoNewline; Write-Host $s.Text -ForegroundColor $s.Color
     $s = Get-DefenderStatus; Write-Host "   [D] Windows Defender (RTP)    : " -NoNewline; Write-Host $s.Text -ForegroundColor $s.Color
-    $s = Get-MitigationStatus; Write-Host "   [M] CPU Mitigations (Spectre) : " -NoNewline; Write-Host $s.Text -ForegroundColor $s.Color
 
     Write-Host ""
     Write-Host "   RUNTIMES & FRAMEWORKS" -ForegroundColor Gray
     Write-Host "   ----------------------------------------" -ForegroundColor DarkGray
     $s = Get-AppStatus "*Visual C++*Redistributable*" "" $installedAppsCache; Write-Host "   [R] VC++ Redist (2015-2022)   : " -NoNewline; Write-Host $s.Text -ForegroundColor $s.Color
-    $s = Get-AppStatus "*Desktop Runtime*9*" "" $installedAppsCache; Write-Host "   [N] .NET 9 Desktop Runtime    : " -NoNewline; Write-Host $s.Text -ForegroundColor $s.Color
+    $s = Get-AppStatus "*Desktop Runtime*8*" "" $installedAppsCache; Write-Host "   [N] .NET 8 Desktop Runtime    : " -NoNewline; Write-Host $s.Text -ForegroundColor $s.Color
     $s = Get-ComponentStatus "DirectX"; Write-Host "   [I] DirectX                   : " -NoNewline; Write-Host $s.Text -ForegroundColor $s.Color
 
     Write-Host ""
@@ -365,7 +323,7 @@ do {
     $s = Get-AppStatus "Google Chrome" "$env:ProgramFiles\Google\Chrome\Application\chrome.exe" $installedAppsCache; Write-Host "   [A] Google Chrome             : " -NoNewline; Write-Host $s.Text -ForegroundColor $s.Color
     $s = Get-AppStatus "Brave" "$env:ProgramFiles\BraveSoftware\Brave-Browser\Application\brave.exe" $installedAppsCache; Write-Host "   [B] Brave Browser             : " -NoNewline; Write-Host $s.Text -ForegroundColor $s.Color
     $s = Get-AppStatus "Mozilla Firefox" "$env:ProgramFiles\Mozilla Firefox\firefox.exe" $installedAppsCache; Write-Host "   [C] Mozilla Firefox           : " -NoNewline; Write-Host $s.Text -ForegroundColor $s.Color
-    $s = Get-AppStatus "Microsoft Edge" "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe" $installedAppsCache; Write-Host "   [E] Microsoft Edge            : " -NoNewline; Write-Host $s.Text -ForegroundColor $s.Color
+    $s = Get-AppStatus "Microsoft Edge" "$env:ProgramFiles (x86)\Microsoft\Edge\Application\msedge.exe" $installedAppsCache; Write-Host "   [E] Microsoft Edge            : " -NoNewline; Write-Host $s.Text -ForegroundColor $s.Color
     $s = Get-AppStatus "LibreWolf" "$env:ProgramFiles\LibreWolf\librewolf.exe" $installedAppsCache; Write-Host "   [L] LibreWolf                 : " -NoNewline; Write-Host $s.Text -ForegroundColor $s.Color
 
     Write-Host ""
@@ -389,15 +347,14 @@ do {
         "9" { Toggle-ContextMenu "PSHereAdmin" }
         "0" { Toggle-ContextMenu "CmdHere" }
 
-        # COMPONENTS & SECURITY
+        # COMPONENTS
         { $_ -eq "w" } { Install-Repair-Winget }
         { $_ -eq "s" } { Toggle-Store }
         { $_ -eq "d" } { Toggle-Defender }
-        { $_ -eq "m" } { Toggle-Mitigations }
 
         # RUNTIMES
         { $_ -eq "r" } { Toggle-App "VC++ Redistributable 2015-2022" "Microsoft.VCRedist.2015+.x64" }
-        { $_ -eq "n" } { Toggle-App ".NET 9 Desktop Runtime" "Microsoft.DotNet.DesktopRuntime.9" }
+        { $_ -eq "n" } { Toggle-App ".NET 8 Desktop Runtime" "Microsoft.DotNet.DesktopRuntime.8" }
         { $_ -eq "i" } { Toggle-App "DirectX End-User Runtimes" "Microsoft.DirectX" }
 
         # APPS

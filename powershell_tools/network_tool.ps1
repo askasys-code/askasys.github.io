@@ -1,65 +1,40 @@
-﻿<#
-.SYNOPSIS
-    NetCare: Advanced Network Tool
-
-.DESCRIPTION
-    A standalone PowerShell tool for managing DNS settings, IP configurations, performing lookups, and resetting the network stack.
-
-    Keybinding Logic:
-    - [1]:   Configure DNS Servers (Google, Cloudflare, AdGuard, etc.).
-    - [2]:   Configure IP Address (DHCP / Static).
-    - [3]:   Run Interactive NSLookup Query.
-    - [4]:   Reset Network Stack (TCP/IP & Winsock).
-    - [X]:   Exit.
-
-.NOTES
-    REQUIRES: Administrator Privileges
-    COMPATIBILITY: PowerShell 5.1+
-    CODING STANDARD: All internal comments must be written in ENGLISH.
-    
-    !!! CRITICAL INSTRUCTION - STRICT OUTPUT RULES - NO EXCEPTIONS !!!
-    1. Whenever asked to modify this script, you MUST ALWAYS return the 
-       ENTIRE source code in a SINGLE, CONTINUOUS CODE BLOCK.
-    2. ABSOLUTELY NO text, introductions, or explanations before or after the code block.
-    3. NO PLACEHOLDERS like "# ... existing code". Every line must be present.
-    4. PRESERVE THIS HEADER UNCHANGED in the output.
-#>
+﻿# REQUIRES: Administrator Privileges
+# COMPATIBILITY: PowerShell 5.1+
+# CODING STANDARD: All internal comments must be written in ENGLISH.
 
 # ---------------------------------------------------------------------------
-# INITIALIZATION
+# INITIALIZATION & SETUP
 # ---------------------------------------------------------------------------
+
+#region Setup, Encoding & Auto-Elevation
+# --- 1. GLOBAL SETTINGS ---
+# Set error preference
 $ErrorActionPreference = "SilentlyContinue"
 
-# Force UTF-8 Encoding for correct display of characters
+# Set Console Encoding to UTF-8
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-# Admin Check & Auto-Elevation
-function Test-Admin {
-    $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
-    return $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-}
+# Enable modern security protocols (TLS 1.2 & 1.3)
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
 
-if (-not (Test-Admin)) {
+# --- 2. ADMIN SELF-ELEVATION ---
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Host "`n [!] Administrator privileges required." -ForegroundColor Yellow
     Write-Host " [!] Restarting as Administrator..." -ForegroundColor White
     
     $scriptPath = $MyInvocation.MyCommand.Definition
-    if ([string]::IsNullOrWhiteSpace($scriptPath)) {
-        Write-Host " [X] Error: Could not determine script path. Run as Admin manually." -ForegroundColor Red
-        Start-Sleep -Seconds 4
-        Exit
-    }
 
     try {
-        # Relaunch the script with RunAs (Admin)
-        Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`"" -Verb RunAs
+        # Restart the process as Admin, maintaining the current working directory
+        Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`"" -Verb RunAs -WorkingDirectory $PSScriptRoot
         Exit
     } catch {
-        Write-Host " [X] Failed to auto-elevate. Please right-click and 'Run as Administrator'." -ForegroundColor Red
-        Start-Sleep -Seconds 4
+        # If the user clicks "No" on the UAC prompt
+        Write-Host " [X] Elevation failed or cancelled by user." -ForegroundColor Red
         Exit
     }
 }
+#endregion
 
 # ---------------------------------------------------------------------------
 # FUNCTIONS

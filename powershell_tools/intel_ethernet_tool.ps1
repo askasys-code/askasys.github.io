@@ -1,63 +1,40 @@
-<#
-.SYNOPSIS
-    Intel Ethernet Multi-Adapter Updater (Failsafe Edition)
-    
-.DESCRIPTION
-    Automated tool to check, search, and update MULTIPLE Intel Ethernet Drivers.
-    
-    Features:
-    - Multi-Adapter Support: Detects and iterates through ALL Intel Ethernet adapters (e.g., I219-V AND I226-V).
-    - Specific Versioning: Searches based on specific Adapter Name to avoid version mismatches between different chipsets.
-    - Hardcoded TLS 1.2 (3072) enforcement.
-    - Automatic Administrator elevation.
-    - Microsoft Update Catalog scraping.
-    - Manual installation helper.
-    
-.NOTES
-    REQUIRES: Administrator Privileges
-    COMPATIBILITY: PowerShell 5.1+
-    CODING STANDARD: All internal comments must be written in ENGLISH.
-    
-    !!! CRITICAL INSTRUCTION - STRICT OUTPUT RULES - NO EXCEPTIONS !!!
-    1. Whenever asked to modify this script, you MUST ALWAYS return the 
-       ENTIRE source code in a SINGLE, CONTINUOUS CODE BLOCK.
-    2. ABSOLUTELY NO text, introductions, or explanations before or after the code block.
-    3. NO PLACEHOLDERS like "# ... existing code". Every line must be present.
-    4. PRESERVE THIS HEADER UNCHANGED in the output.
-#>
+# REQUIRES: Administrator Privileges
+# COMPATIBILITY: PowerShell 5.1+
+# CODING STANDARD: All internal comments must be written in ENGLISH.
 
 # ---------------------------------------------------------------------------
-# INITIALIZATION
+# INITIALIZATION & SETUP
 # ---------------------------------------------------------------------------
+
+#region Setup, Encoding & Auto-Elevation
+# --- 1. GLOBAL SETTINGS ---
+# Set error preference
 $ErrorActionPreference = "SilentlyContinue"
 
-# Admin Check & Auto-Elevation
-function Test-Admin {
-    $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
-    return $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-}
+# Set Console Encoding to UTF-8
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-if (-not (Test-Admin)) {
+# Enable modern security protocols (TLS 1.2 & 1.3)
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+
+# --- 2. ADMIN SELF-ELEVATION ---
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Host "`n [!] Administrator privileges required." -ForegroundColor Yellow
     Write-Host " [!] Restarting as Administrator..." -ForegroundColor White
     
     $scriptPath = $MyInvocation.MyCommand.Definition
-    if ([string]::IsNullOrWhiteSpace($scriptPath)) {
-        Write-Host " [X] Error: Could not determine script path. Run as Admin manually." -ForegroundColor Red
-        Start-Sleep -Seconds 4
-        Exit
-    }
 
     try {
-        # Relaunch the script with RunAs (Admin)
-        Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`"" -Verb RunAs
+        # Restart the process as Admin, maintaining the current working directory
+        Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`"" -Verb RunAs -WorkingDirectory $PSScriptRoot
         Exit
     } catch {
-        Write-Host " [X] Failed to auto-elevate. Please right-click and 'Run as Administrator'." -ForegroundColor Red
-        Start-Sleep -Seconds 4
+        # If the user clicks "No" on the UAC prompt
+        Write-Host " [X] Elevation failed or cancelled by user." -ForegroundColor Red
         Exit
     }
 }
+#endregion
 
 # Configuration
 $UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"

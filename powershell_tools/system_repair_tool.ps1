@@ -2,12 +2,39 @@
 # COMPATIBILITY: PowerShell 5.1+
 # CODING STANDARD: All internal comments must be written in ENGLISH.
 
-# Force UTF-8 Encoding for correct display of borders/characters
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-$Host.UI.RawUI.WindowTitle = "WinCare System Repair | v2.1 | 2026"
+# ---------------------------------------------------------------------------
+# INITIALIZATION & SETUP
+# ---------------------------------------------------------------------------
 
-# Ensure TLS 1.2 is used for external web calls
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+#region Setup, Encoding & Auto-Elevation
+# --- 1. GLOBAL SETTINGS ---
+# Set error preference
+$ErrorActionPreference = "SilentlyContinue"
+
+# Set Console Encoding to UTF-8
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
+# Enable modern security protocols (TLS 1.2 & 1.3)
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+
+# --- 2. ADMIN SELF-ELEVATION ---
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Host "`n [!] Administrator privileges required." -ForegroundColor Yellow
+    Write-Host " [!] Restarting as Administrator..." -ForegroundColor White
+    
+    $scriptPath = $MyInvocation.MyCommand.Definition
+
+    try {
+        # Restart the process as Admin, maintaining the current working directory
+        Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`"" -Verb RunAs -WorkingDirectory $PSScriptRoot
+        Exit
+    } catch {
+        # If the user clicks "No" on the UAC prompt
+        Write-Host " [X] Elevation failed or cancelled by user." -ForegroundColor Red
+        Exit
+    }
+}
+#endregion
 
 #region Global Variables
 function Draw-Header {
