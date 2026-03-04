@@ -15,7 +15,7 @@ $ErrorActionPreference = "SilentlyContinue"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 # Enable modern security protocols (TLS 1.2 & 1.3)
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+[Net.ServicePointManager]::SecurityProtocol =[Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
 
 # --- 2. ADMIN SELF-ELEVATION ---
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -158,6 +158,50 @@ function Invoke-OriginalThumbnails {
 }
 #endregion
 
+#region Function Group 5: Clipboard, Snipping Tool & Extra Temp
+function Invoke-ExtraCleanup {
+    Write-Host "`n=== Cleaning Clipboard, ScreenClips & Extra Temp ===" -ForegroundColor Cyan
+    
+    # Step 1: Clipboard
+    Write-Host "1. Clearing Clipboard & Clipboard History..." -ForegroundColor Yellow
+    Set-Clipboard $null -ErrorAction SilentlyContinue
+    cmd.exe /c "echo off | clip"
+    # Restart Clipboard User Service to clear history effectively
+    Restart-Service -Name "cbdhsvc*" -Force -ErrorAction SilentlyContinue
+
+    # Step 2: ScreenClips / Snipping Tool
+    Write-Host "2. Cleaning Snipping Tool (ScreenClips)..." -ForegroundColor Yellow
+    Remove-Item -Path "$env:LOCALAPPDATA\Packages\MicrosoftWindows.Client.Core_cw5n1h2txyewy\TempState\ScreenClip\*" -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path "$env:LOCALAPPDATA\Packages\Microsoft.ScreenSketch_8wekyb3d8bbwe\TempState\*" -Recurse -Force -ErrorAction SilentlyContinue
+
+    # Step 3: Windows Prefetch
+    Write-Host "3. Cleaning Windows Prefetch..." -ForegroundColor Yellow
+    Remove-Item -Path "C:\Windows\Prefetch\*" -Recurse -Force -ErrorAction SilentlyContinue
+
+    # Step 4: Crash Dumps & Windows Error Reporting
+    Write-Host "4. Cleaning Crash Dumps & Windows Error Reporting..." -ForegroundColor Yellow
+    Remove-Item -Path "$env:LOCALAPPDATA\CrashDumps\*" -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path "C:\ProgramData\Microsoft\Windows\WER\ReportArchive\*" -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path "C:\ProgramData\Microsoft\Windows\WER\ReportQueue\*" -Recurse -Force -ErrorAction SilentlyContinue
+
+    # Step 5: Recent Items
+    Write-Host "5. Cleaning Recent Items History..." -ForegroundColor Yellow
+    Remove-Item -Path "$env:APPDATA\Microsoft\Windows\Recent\*" -Recurse -Force -ErrorAction SilentlyContinue
+
+    # Step 6: INetCache
+    Write-Host "6. Cleaning INetCache..." -ForegroundColor Yellow
+    Remove-Item -Path "$env:LOCALAPPDATA\Microsoft\Windows\INetCache\*" -Recurse -Force -ErrorAction SilentlyContinue
+
+    # Step 7: DNS Cache
+    Write-Host "7. Flushing DNS Cache..." -ForegroundColor Yellow
+    Clear-DnsClientCache -ErrorAction SilentlyContinue
+    ipconfig /flushdns | Out-Null
+
+    Write-Host "`n[OK] Extra Cleanup Complete." -ForegroundColor Green
+    Pause-Script
+}
+#endregion
+
 # ---------------------------------------------------------------------------
 # MAIN LOOP
 # ---------------------------------------------------------------------------
@@ -190,6 +234,19 @@ do {
     $pathGroup4 = @("$env:LOCALAPPDATA\Microsoft\Windows\Explorer")
     $sizeGroup4 = Get-PathSize $pathGroup4
 
+    # Group 5: Clipboard, Snipping Tool & Extra Temp
+    $pathsGroup5 = @(
+        "$env:LOCALAPPDATA\Packages\MicrosoftWindows.Client.Core_cw5n1h2txyewy\TempState\ScreenClip",
+        "$env:LOCALAPPDATA\Packages\Microsoft.ScreenSketch_8wekyb3d8bbwe\TempState",
+        "C:\Windows\Prefetch",
+        "$env:LOCALAPPDATA\CrashDumps",
+        "C:\ProgramData\Microsoft\Windows\WER\ReportArchive",
+        "C:\ProgramData\Microsoft\Windows\WER\ReportQueue",
+        "$env:APPDATA\Microsoft\Windows\Recent",
+        "$env:LOCALAPPDATA\Microsoft\Windows\INetCache"
+    )
+    $sizeGroup5 = Get-PathSize $pathsGroup5
+
     Clear-Host
     Write-Host "   =========================================" -ForegroundColor Cyan
     Write-Host "                 CLEANER TOOL               " -ForegroundColor White
@@ -203,7 +260,8 @@ do {
         @{ ID="1"; Name="Temp Files, Logs & Recycle Bin"; Size=(Format-ByteSize $sizeGroup1); Color="Green" },
         @{ ID="2"; Name="Windows Update & Store Cache";   Size=(Format-ByteSize $sizeGroup2); Color="Green" },
         @{ ID="3"; Name="WinSxS Component Store";         Size="[Optimization Action]";       Color="Gray" },
-        @{ ID="4"; Name="Thumbnail Cache";                Size=(Format-ByteSize $sizeGroup4); Color="Green" }
+        @{ ID="4"; Name="Thumbnail Cache";                Size=(Format-ByteSize $sizeGroup4); Color="Green" },
+        @{ ID="5"; Name="Clipboard, ScreenClips & Extra"; Size=(Format-ByteSize $sizeGroup5); Color="Green" }
     )
 
     # Display Menu
@@ -228,6 +286,7 @@ do {
         "2" { Invoke-OriginalUpdateStore }
         "3" { Invoke-OriginalWinSxS }
         "4" { Invoke-OriginalThumbnails }
+        "5" { Invoke-ExtraCleanup }
         { $_ -eq "x" -or $_ -eq "X" } { exit }
         Default { Write-Host "   Invalid selection." -ForegroundColor Red; Start-Sleep 1 }
     }
