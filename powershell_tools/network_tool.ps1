@@ -8,8 +8,8 @@
 
 #region Setup, Encoding & Auto-Elevation
 # --- 1. GLOBAL SETTINGS ---
-# Set error preference
-$ErrorActionPreference = "SilentlyContinue"
+# Set error preference to standard Continue to avoid hiding unexpected system errors globally
+$ErrorActionPreference = "Continue"
 
 # Set Console Encoding to UTF-8
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -52,15 +52,21 @@ function Get-NetworkStatusUI {
     if ($adapter) {
         # Get DNS
         $dns = "DHCP/Automatic"
-        $dnsObj = Get-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4
+        $dnsObj = Get-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
         if ($dnsObj -and $dnsObj.ServerAddresses) {
             $dns = $dnsObj.ServerAddresses -join ", "
         }
 
-        # Get IP
-        $ipConf = Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
+        # Get IP - Filters out APIPA (169.254.x.x) addresses
+        $ipConf = Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                  Where-Object { $_.IPAddress -notlike "169.254.*" } |
+                  Select-Object -First 1
+
         $ipStr = if ($ipConf) { $ipConf.IPAddress } else { "Unknown" }
-        $dhcpStatus = if ($ipConf.PrefixOrigin -eq "Dhcp") { " (DHCP)" } else { " (Static)" }
+        $dhcpStatus = ""
+        if ($ipConf) {
+            $dhcpStatus = if ($ipConf.PrefixOrigin -eq "Dhcp") { " (DHCP)" } else { " (Static)" }
+        }
 
         Write-Host "   Active Adapter: $($adapter.Name)" -ForegroundColor Green
         Write-Host "   Current IP      : $ipStr$dhcpStatus" -ForegroundColor Green
@@ -149,12 +155,14 @@ function Set-DnsServers {
                 Set-DnsClientServerAddress -InterfaceIndex $selectedAdapter.ifIndex -ResetServerAddresses -ErrorAction Stop
                 Write-Host "   [OK] DNS reset to DHCP (Automatic)." -ForegroundColor Green
             } else {
-                Set-DnsClientServerAddress -InterfaceIndex $selectedAdapter.ifIndex -ServerAddresses ($selectedDNS.Primary, $selectedDNS.Secondary) -ErrorAction Stop
+                # Ensure DNS addresses are passed as an explicit string array to prevent binding issues
+                [string[]]$dnsAddresses = @($selectedDNS.Primary, $selectedDNS.Secondary)
+                Set-DnsClientServerAddress -InterfaceIndex $selectedAdapter.ifIndex -ServerAddresses $dnsAddresses -ErrorAction Stop
                 Write-Host "   [OK] DNS set to: $($selectedDNS.Name)" -ForegroundColor Green
             }
             
             Write-Host "   [INFO] Flushing DNS cache..." -ForegroundColor DarkCyan
-            Clear-DnsClientCache
+            Clear-DnsClientCache -ErrorAction SilentlyContinue
         } catch {
             Write-Host "   [X] ERROR applying DNS: $($_.Exception.Message)" -ForegroundColor Red
         }
@@ -187,8 +195,8 @@ function Set-IpConfiguration {
             Write-Host "   [INFO] Enabling DHCP..." -ForegroundColor Yellow
             Set-NetIPInterface -InterfaceIndex $idx -Dhcp Enabled -AddressFamily IPv4 -ErrorAction Stop
             
-            $resetDns = Read-Host "   Reset DNS to Automatic as well? (Y/N)"
-            if ($resetDns -eq "Y" -or $resetDns -eq "y") {
+            $resetDns = Read-Host "   Reset DNS to Automatic as well? (Y/N) [Default: Y]"
+            if ([string]::IsNullOrWhiteSpace($resetDns) -or $resetDns -match "^y(es)?$") {
                 Set-DnsClientServerAddress -InterfaceIndex $idx -ResetServerAddresses -ErrorAction SilentlyContinue
                 Write-Host "   [OK] DNS reset to DHCP." -ForegroundColor Green
             }
@@ -205,8 +213,10 @@ function Set-IpConfiguration {
         # 1. Get IP
         $ip = Read-Host "   Enter IP Address (e.g., 192.168.1.50)"
         
-        if ($ip -notmatch '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$') {
-            Write-Host "   [X] Invalid IP address format." -ForegroundColor Red
+        # Robust .NET IP parsing instead of standard regex
+        $parsedIp = $null
+        if (-not [System.Net.IPAddress]::TryParse($ip, [ref]$parsedIp) -or $parsedIp.AddressFamily -ne 'InterNetwork') {
+            Write-Host "   [X] Invalid IPv4 address format." -ForegroundColor Red
             Pause-Script
             return
         }
@@ -237,14 +247,24 @@ function Set-IpConfiguration {
             Write-Host "   [X] Error calculating defaults." -ForegroundColor Red
         }
         
-        if ([string]::IsNullOrWhiteSpace($gateway)) { Write-Host "   [X] Gateway required."; Pause-Script; return }
-        if ([string]::IsNullOrWhiteSpace($prefix)) { $prefix = "24" }
+        # Validate Gateway and Prefix
+        $parsedGw = $null
+        if ([string]::IsNullOrWhiteSpace($gateway) -or -not [System.Net.IPAddress]::TryParse($gateway, [ref]$parsedGw) -or $parsedGw.AddressFamily -ne 'InterNetwork') {
+            Write-Host "   [X] Invalid Gateway address format." -ForegroundColor Red
+            Pause-Script
+            return
+        }
+        
+        if ($prefix -notmatch '^\d+$' -or [int]$prefix -lt 1 -or [int]$prefix -gt 32) {
+            Write-Host "   [!] Invalid Prefix length. Defaulting to 24." -ForegroundColor Yellow
+            $prefix = "24"
+        }
 
         try {
             Write-Host "   [INFO] Applying Static IP configuration..." -ForegroundColor Yellow
             
             # STEP 1: Disable DHCP explicitly
-            Set-NetIPInterface -InterfaceIndex $idx -Dhcp Disabled -AddressFamily IPv4 -ErrorAction SilentlyContinue
+            Set-NetIPInterface -InterfaceIndex $idx -Dhcp Disabled -AddressFamily IPv4 -ErrorAction Stop
 
             # STEP 2: Remove existing IP addresses
             Remove-NetIPAddress -InterfaceIndex $idx -AddressFamily IPv4 -Confirm:$false -ErrorAction SilentlyContinue

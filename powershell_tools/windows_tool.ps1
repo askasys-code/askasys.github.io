@@ -4,7 +4,7 @@
 
 <#
     Windows Tweaks & Optimization Tool
-    Updated: 2026-02-23
+    Updated: 2026-07-05
     Description: General toolbox for UI, Context Menus, Apps, and CPU performance tweaks.
 #>
 
@@ -24,10 +24,18 @@ if (-not $isAdmin) {
     Write-Host "`n [!] Administrator privileges required." -ForegroundColor Yellow
     Write-Host " [!] Restarting as Administrator..." -ForegroundColor White
     
-    $scriptPath = $MyInvocation.MyCommand.Definition
+    # Securely resolve current script path
+    $scriptPath = $MyInvocation.MyCommand.Path
+    if (-not $scriptPath) { $scriptPath = $MyInvocation.MyCommand.Definition }
 
     try {
-        Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`"" -Verb RunAs -WorkingDirectory $PSScriptRoot
+        # Using an array for ArgumentList is safer against spaces in paths
+        $argList = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$scriptPath`"")
+        if ($PSScriptRoot) {
+            Start-Process powershell.exe -ArgumentList $argList -Verb RunAs -WorkingDirectory $PSScriptRoot
+        } else {
+            Start-Process powershell.exe -ArgumentList $argList -Verb RunAs
+        }
         Exit
     } catch {
         Write-Host " [X] Elevation failed or cancelled by user." -ForegroundColor Red
@@ -42,7 +50,32 @@ if (-not $isAdmin) {
 
 function Get-RegistryStatus {
     param ([string]$Path, [string]$Name, [int]$TargetValue)
-    $current = (Get-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue).$Name
+    $current = $null
+    
+    # Performance Optimization: Use rapid .NET registry query first
+    try {
+        if ($Path -match '^HKCU:\\(.*)$') {
+            $subPath = $Matches[1]
+            $regKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($subPath)
+            if ($regKey) {
+                $current = $regKey.GetValue($Name)
+                $regKey.Close()
+            }
+        } elseif ($Path -match '^HKLM:\\(.*)$') {
+            $subPath = $Matches[1]
+            $regKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($subPath)
+            if ($regKey) {
+                $current = $regKey.GetValue($Name)
+                $regKey.Close()
+            }
+        }
+    } catch {}
+
+    # Fallback to standard PowerShell cmdlet if .NET is restricted
+    if ($current -eq $null) {
+        $current = (Get-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue).$Name
+    }
+    
     if ($current -eq $null) { $current = 0 }
 
     if ($current -eq $TargetValue) {
@@ -60,7 +93,7 @@ function Get-ContextStatus {
 
 function Get-AppStatus {
     param ([string]$SearchPattern, [string]$ExePath, [System.Collections.IDictionary]$AppCache)
-    if ($ExePath -and (Test-Path $ExePath)) { return @{ Text="INSTALLED"; Color="Green" } }
+    if ($ExePath -and (Test-Path $ExePath -ErrorAction SilentlyContinue)) { return @{ Text="INSTALLED"; Color="Green" } }
     foreach ($appName in $AppCache.Keys) {
         if ($appName -like $SearchPattern) { return @{ Text="INSTALLED"; Color="Green" } }
     }
@@ -68,14 +101,45 @@ function Get-AppStatus {
 }
 
 function Get-DefenderStatus {
-    $regValue = (Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows Defender\Real-Time Protection" -Name "DisableRealtimeMonitoring" -ErrorAction SilentlyContinue).DisableRealtimeMonitoring
-    if ($regValue -eq 0 -or $regValue -eq $null) { return @{ Text="ACTIVE   "; Color="Green" } } 
-    else { return @{ Text="DISABLED "; Color="Red" } }
+    $current = $null
+    try {
+        $regKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("SOFTWARE\Microsoft\Windows Defender\Real-Time Protection")
+        if ($regKey) {
+            $current = $regKey.GetValue("DisableRealtimeMonitoring")
+            $regKey.Close()
+        }
+    } catch {}
+    
+    if ($current -eq $null) {
+        $current = (Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows Defender\Real-Time Protection" -Name "DisableRealtimeMonitoring" -ErrorAction SilentlyContinue).DisableRealtimeMonitoring
+    }
+    
+    # Secondary check: verification of the actual background service
+    $service = Get-Service -Name "WinDefend" -ErrorAction SilentlyContinue
+    if ($service -and $service.Status -ne "Running") {
+        return @{ Text="DISABLED "; Color="Red" }
+    }
+
+    if ($current -eq 1) { 
+        return @{ Text="DISABLED "; Color="Red" } 
+    } 
+    return @{ Text="ACTIVE   "; Color="Green" }
 }
 
 function Get-MitigationStatus {
     $path = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management"
-    $val = (Get-ItemProperty -Path $path -Name "FeatureSettingsOverride" -ErrorAction SilentlyContinue).FeatureSettingsOverride
+    $val = $null
+    try {
+        $regKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management")
+        if ($regKey) {
+            $val = $regKey.GetValue("FeatureSettingsOverride")
+            $regKey.Close()
+        }
+    } catch {}
+    
+    if ($val -eq $null) {
+        $val = (Get-ItemProperty -Path $path -Name "FeatureSettingsOverride" -ErrorAction SilentlyContinue).FeatureSettingsOverride
+    }
     
     # 3 = Mitigations OFF (Fastest but vulnerable)
     # 0 / null = Mitigations ON (Secure but slower)
@@ -95,7 +159,7 @@ function Get-ComponentStatus {
             return @{ Text="MISSING  "; Color="Red" }
         }
         "DirectX" {
-            if (Test-Path "$env:SystemRoot\System32\d3dx9_43.dll") { return @{ Text="INSTALLED"; Color="Green" } }
+            if (Test-Path "$env:SystemRoot\System32\d3dx9_43.dll" -ErrorAction SilentlyContinue) { return @{ Text="INSTALLED"; Color="Green" } }
             return @{ Text="MISSING  "; Color="DarkGray" }
         }
     }
@@ -107,15 +171,15 @@ function Get-ComponentStatus {
 
 function Toggle-Registry {
     param ([string]$Path, [string]$Name, [int]$OnValue, [int]$OffValue, [string]$Desc)
-    if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
+    if (-not (Test-Path $Path)) { $null = New-Item -Path $Path -Force -ErrorAction SilentlyContinue }
     $current = (Get-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue).$Name
     if ($current -eq $null) { $current = $OffValue }
 
     if ($current -eq $OnValue) {
-        Set-ItemProperty -Path $Path -Name $Name -Value $OffValue -Type DWord -Force
+        Set-ItemProperty -Path $Path -Name $Name -Value $OffValue -Type DWord -Force | Out-Null
         Write-Host "   [-] $Desc set to DISABLED/OFF." -ForegroundColor Yellow
     } else {
-        Set-ItemProperty -Path $Path -Name $Name -Value $OnValue -Type DWord -Force
+        Set-ItemProperty -Path $Path -Name $Name -Value $OnValue -Type DWord -Force | Out-Null
         Write-Host "   [+] $Desc set to ENABLED/ON." -ForegroundColor Green
     }
 }
@@ -132,85 +196,119 @@ function Toggle-ContextMenu {
     switch ($Type) {
         "ClassicMenu" {
             $path = "Registry::HKEY_CURRENT_USER\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}"
-            if (Test-Path $path) { Remove-Item $path -Recurse -Force; Write-Host "   [-] Reverted to Windows 11 Default Menu." -ForegroundColor Yellow } 
-            else { New-Item "$path\InprocServer32" -Force | Out-Null; Set-ItemProperty "$path\InprocServer32" -Name "(default)" -Value ""; Write-Host "   [+] Classic Context Menu enabled." -ForegroundColor Green }
+            if (Test-Path $path) { 
+                Remove-Item $path -Recurse -Force -ErrorAction SilentlyContinue
+                Write-Host "   [-] Reverted to Windows 11 Default Menu." -ForegroundColor Yellow 
+            } else { 
+                $null = New-Item "$path\InprocServer32" -Force -ErrorAction SilentlyContinue
+                Set-ItemProperty "$path\InprocServer32" -Name "(default)" -Value "" -Force -ErrorAction SilentlyContinue
+                Write-Host "   [+] Classic Context Menu enabled." -ForegroundColor Green 
+            }
             Toggle-ExplorerRestart
         }
         "TakeOwnership" {
             $path = "Registry::HKEY_CLASSES_ROOT\Directory\shell\TakeOwnership"
             if (Test-Path $path) {
-                Remove-Item "Registry::HKEY_CLASSES_ROOT\*\shell\TakeOwnership" -Recurse -Force
-                Remove-Item "Registry::HKEY_CLASSES_ROOT\Directory\shell\TakeOwnership" -Recurse -Force
+                Remove-Item "Registry::HKEY_CLASSES_ROOT\*\shell\TakeOwnership" -Recurse -Force -ErrorAction SilentlyContinue
+                Remove-Item "Registry::HKEY_CLASSES_ROOT\Directory\shell\TakeOwnership" -Recurse -Force -ErrorAction SilentlyContinue
                 Write-Host "   [-] Take Ownership Extension removed." -ForegroundColor Yellow
             } else {
-                $p1 = "Registry::HKEY_CLASSES_ROOT\*\shell\TakeOwnership"; New-Item $p1 -Force | Out-Null; Set-ItemProperty $p1 -Name "(default)" -Value "Take Ownership"; Set-ItemProperty $p1 -Name "HasLUAShield" -Value ""
-                New-Item "$p1\command" -Force | Out-Null; Set-ItemProperty "$p1\command" -Name "(default)" -Value 'cmd.exe /c takeown /f "%1" && icacls "%1" /grant administrators:F'
-                $p2 = "Registry::HKEY_CLASSES_ROOT\Directory\shell\TakeOwnership"; New-Item $p2 -Force | Out-Null; Set-ItemProperty $p2 -Name "(default)" -Value "Take Ownership"; Set-ItemProperty $p2 -Name "HasLUAShield" -Value ""
-                New-Item "$p2\command" -Force | Out-Null; Set-ItemProperty "$p2\command" -Name "(default)" -Value 'cmd.exe /c takeown /f "%1" /r /d y && icacls "%1" /grant administrators:F /t'
+                $p1 = "Registry::HKEY_CLASSES_ROOT\*\shell\TakeOwnership"
+                $null = New-Item $p1 -Force -ErrorAction SilentlyContinue
+                Set-ItemProperty $p1 -Name "(default)" -Value "Take Ownership" -Force -ErrorAction SilentlyContinue
+                Set-ItemProperty $p1 -Name "HasLUAShield" -Value "" -Force -ErrorAction SilentlyContinue
+                
+                $null = New-Item "$p1\command" -Force -ErrorAction SilentlyContinue
+                Set-ItemProperty "$p1\command" -Name "(default)" -Value 'cmd.exe /c takeown /f "%1" && icacls "%1" /grant administrators:F' -Force -ErrorAction SilentlyContinue
+                
+                $p2 = "Registry::HKEY_CLASSES_ROOT\Directory\shell\TakeOwnership"
+                $null = New-Item $p2 -Force -ErrorAction SilentlyContinue
+                Set-ItemProperty $p2 -Name "(default)" -Value "Take Ownership" -Force -ErrorAction SilentlyContinue
+                Set-ItemProperty $p2 -Name "HasLUAShield" -Value "" -Force -ErrorAction SilentlyContinue
+                
+                $null = New-Item "$p2\command" -Force -ErrorAction SilentlyContinue
+                Set-ItemProperty "$p2\command" -Name "(default)" -Value 'cmd.exe /c takeown /f "%1" /r /d y && icacls "%1" /grant administrators:F /t' -Force -ErrorAction SilentlyContinue
+                
                 Write-Host "   [+] Take Ownership Extension added." -ForegroundColor Green
             }
         }
         "PowerPlan" {
             $path = "Registry::HKEY_CLASSES_ROOT\DesktopBackground\Shell\PowerPlan"
-            if (Test-Path $path) { Remove-Item $path -Recurse -Force; Write-Host "   [-] Power Options Menu removed." -ForegroundColor Yellow } 
-            else {
-                New-Item "$path" -Force | Out-Null; Set-ItemProperty "$path" -Name "MUIVerb" -Value "Choose Power Plan"; Set-ItemProperty "$path" -Name "Icon" -Value "powercpl.dll"; Set-ItemProperty "$path" -Name "Position" -Value "Middle"
-                $plans = @{"01"=@("Balanced"; "381b4222-f694-41f0-9685-ff5bb260df2e"); "02"=@("High Performance"; "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c")}
+            if (Test-Path $path) { 
+                Remove-Item $path -Recurse -Force -ErrorAction SilentlyContinue
+                Write-Host "   [-] Power Options Menu removed." -ForegroundColor Yellow 
+            } else {
+                $null = New-Item "$path" -Force -ErrorAction SilentlyContinue
+                Set-ItemProperty "$path" -Name "MUIVerb" -Value "Choose Power Plan" -Force -ErrorAction SilentlyContinue
+                Set-ItemProperty "$path" -Name "Icon" -Value "powercpl.dll" -Force -ErrorAction SilentlyContinue
+                Set-ItemProperty "$path" -Name "Position" -Value "Middle" -Force -ErrorAction SilentlyContinue
+                
+                # Ordered dictionary prevents randomized menu rendering order
+                $plans = [ordered]@{"01"=@("Balanced"; "381b4222-f694-41f0-9685-ff5bb260df2e"); "02"=@("High Performance"; "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c")}
                 foreach ($k in $plans.Keys) {
-                    $sub = "$path\shell\${k}menu"; New-Item $sub -Force | Out-Null; Set-ItemProperty $sub -Name "MUIVerb" -Value $plans[$k][0]; Set-ItemProperty $sub -Name "Icon" -Value "powercpl.dll"
-                    New-Item "$sub\command" -Force | Out-Null; Set-ItemProperty "$sub\command" -Name "(default)" -Value "powercfg.exe /setactive $($plans[$k][1])"
+                    $sub = "$path\shell\${k}menu"
+                    $null = New-Item $sub -Force -ErrorAction SilentlyContinue
+                    Set-ItemProperty $sub -Name "MUIVerb" -Value $plans[$k][0] -Force -ErrorAction SilentlyContinue
+                    Set-ItemProperty $sub -Name "Icon" -Value "powercpl.dll" -Force -ErrorAction SilentlyContinue
+                    
+                    $null = New-Item "$sub\command" -Force -ErrorAction SilentlyContinue
+                    Set-ItemProperty "$sub\command" -Name "(default)" -Value "powercfg.exe /setactive $($plans[$k][1])" -Force -ErrorAction SilentlyContinue
                 }
                 Write-Host "   [+] Power Options Menu added." -ForegroundColor Green
             }
         }
         "RunPS1Admin" {
             $path = "Registry::HKEY_CLASSES_ROOT\Microsoft.PowerShellScript.1\Shell\runas"
-            if (Test-Path $path) { Remove-Item $path -Recurse -Force; Write-Host "   [-] Elevated .ps1 Execution Menu removed." -ForegroundColor Yellow } 
-            else {
-                New-Item "$path\command" -Force | Out-Null
-                Set-ItemProperty $path -Name "HasLUAShield" -Value ""
-                Set-ItemProperty "$path\command" -Name "(default)" -Value 'powershell.exe -Command "if((Get-ExecutionPolicy ) -ne ''AllSigned'') { Set-ExecutionPolicy -Scope Process Bypass }; & ''%1''"'
+            if (Test-Path $path) { 
+                Remove-Item $path -Recurse -Force -ErrorAction SilentlyContinue
+                Write-Host "   [-] Elevated .ps1 Execution Menu removed." -ForegroundColor Yellow 
+            } else {
+                $null = New-Item "$path\command" -Force -ErrorAction SilentlyContinue
+                Set-ItemProperty $path -Name "HasLUAShield" -Value "" -Force -ErrorAction SilentlyContinue
+                Set-ItemProperty "$path\command" -Name "(default)" -Value 'powershell.exe -Command "if((Get-ExecutionPolicy ) -ne ''AllSigned'') { Set-ExecutionPolicy -Scope Process Bypass }; & ''%1''"' -Force -ErrorAction SilentlyContinue
                 Write-Host "   [+] Elevated .ps1 Execution Menu added." -ForegroundColor Green
             }
         }
         "PSHereAdmin" {
             $roots = @("Registry::HKEY_CLASSES_ROOT\Directory\Background\shell\PowerShellAsAdmin", "Registry::HKEY_CLASSES_ROOT\Directory\shell\PowerShellAsAdmin", "Registry::HKEY_CLASSES_ROOT\Drive\shell\PowerShellAsAdmin")
             if (Test-Path $roots[0]) { 
-                foreach ($r in $roots) { Remove-Item $r -Recurse -Force }
+                foreach ($r in $roots) { Remove-Item $r -Recurse -Force -ErrorAction SilentlyContinue }
                 Write-Host "   [-] Elevated PowerShell Here Menu removed." -ForegroundColor Yellow 
             } else {
                 foreach ($r in $roots) {
-                    New-Item "$r\command" -Force | Out-Null
-                    Set-ItemProperty $r -Name "(default)" -Value "Open PowerShell here as administrator"
-                    Set-ItemProperty $r -Name "Icon" -Value "powershell.exe"
-                    Set-ItemProperty $r -Name "HasLUAShield" -Value ""
-                    Set-ItemProperty "$r\command" -Name "(default)" -Value 'powershell.exe -WindowStyle Hidden -Command "Start-Process powershell.exe -ArgumentList ''-NoExit -NoProfile -Command Set-Location -LiteralPath \"\"%V\"\"'' -Verb RunAs"'
+                    $null = New-Item "$r\command" -Force -ErrorAction SilentlyContinue
+                    Set-ItemProperty $r -Name "(default)" -Value "Open PowerShell here as administrator" -Force -ErrorAction SilentlyContinue
+                    Set-ItemProperty $r -Name "Icon" -Value "powershell.exe" -Force -ErrorAction SilentlyContinue
+                    Set-ItemProperty $r -Name "HasLUAShield" -Value "" -Force -ErrorAction SilentlyContinue
+                    Set-ItemProperty "$r\command" -Name "(default)" -Value 'powershell.exe -WindowStyle Hidden -Command "Start-Process powershell.exe -ArgumentList ''-NoExit -NoProfile -Command Set-Location -LiteralPath \"\"%V\"\"'' -Verb RunAs"' -Force -ErrorAction SilentlyContinue
                 }
-                Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name "EnableLinkedConnections" -Value 1 -Type DWord -Force
+                Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name "EnableLinkedConnections" -Value 1 -Type DWord -Force | Out-Null
                 Write-Host "   [+] Elevated PowerShell Here Menu added." -ForegroundColor Green
             }
         }
         "CmdHere" {
             $roots = @("Registry::HKEY_CLASSES_ROOT\DesktopBackground\shell\CommandPrompt", "Registry::HKEY_CLASSES_ROOT\Directory\Background\shell\CommandPrompt", "Registry::HKEY_CLASSES_ROOT\Directory\shell\CommandPrompt", "Registry::HKEY_CLASSES_ROOT\Drive\shell\CommandPrompt")
             if (Test-Path $roots[0]) { 
-                foreach ($r in $roots) { Remove-Item $r -Recurse -Force }
+                foreach ($r in $roots) { Remove-Item $r -Recurse -Force -ErrorAction SilentlyContinue }
                 Write-Host "   [-] Extended CMD Prompts Here Menu removed." -ForegroundColor Yellow 
             } else {
                 foreach ($r in $roots) {
-                    New-Item $r -Force | Out-Null
-                    Set-ItemProperty $r -Name "MUIVerb" -Value "Command Prompt"
-                    Set-ItemProperty $r -Name "Icon" -Value "cmd.exe"
-                    Set-ItemProperty $r -Name "SubCommands" -Value ""
+                    $null = New-Item $r -Force -ErrorAction SilentlyContinue
+                    Set-ItemProperty $r -Name "MUIVerb" -Value "Command Prompt" -Force -ErrorAction SilentlyContinue
+                    Set-ItemProperty $r -Name "Icon" -Value "cmd.exe" -Force -ErrorAction SilentlyContinue
+                    Set-ItemProperty $r -Name "SubCommands" -Value "" -Force -ErrorAction SilentlyContinue
 
-                    $cmd1 = "$r\shell\cmd1"; New-Item "$cmd1\command" -Force | Out-Null
-                    Set-ItemProperty $cmd1 -Name "MUIVerb" -Value "Open here"
-                    Set-ItemProperty $cmd1 -Name "Icon" -Value "cmd.exe"
-                    Set-ItemProperty "$cmd1\command" -Name "(default)" -Value 'cmd.exe /s /k pushd "%V"'
+                    $cmd1 = "$r\shell\cmd1"
+                    $null = New-Item "$cmd1\command" -Force -ErrorAction SilentlyContinue
+                    Set-ItemProperty $cmd1 -Name "MUIVerb" -Value "Open here" -Force -ErrorAction SilentlyContinue
+                    Set-ItemProperty $cmd1 -Name "Icon" -Value "cmd.exe" -Force -ErrorAction SilentlyContinue
+                    Set-ItemProperty "$cmd1\command" -Name "(default)" -Value 'cmd.exe /s /k pushd "%V"' -Force -ErrorAction SilentlyContinue
 
-                    $cmd2 = "$r\shell\cmd2"; New-Item "$cmd2\command" -Force | Out-Null
-                    Set-ItemProperty $cmd2 -Name "MUIVerb" -Value "Open here as administrator"
-                    Set-ItemProperty $cmd2 -Name "HasLUAShield" -Value ""
-                    Set-ItemProperty "$cmd2\command" -Name "(default)" -Value 'powershell.exe -WindowStyle Hidden -Command "Start-Process cmd.exe -ArgumentList ''/s /k pushd \"\"%V\"\"'' -Verb RunAs"'
+                    $cmd2 = "$r\shell\cmd2"
+                    $null = New-Item "$cmd2\command" -Force -ErrorAction SilentlyContinue
+                    Set-ItemProperty $cmd2 -Name "MUIVerb" -Value "Open here as administrator" -Force -ErrorAction SilentlyContinue
+                    Set-ItemProperty $cmd2 -Name "HasLUAShield" -Value "" -Force -ErrorAction SilentlyContinue
+                    Set-ItemProperty "$cmd2\command" -Name "(default)" -Value 'powershell.exe -WindowStyle Hidden -Command "Start-Process cmd.exe -ArgumentList ''/s /k pushd \"\"%V\"\"'' -Verb RunAs"' -Force -ErrorAction SilentlyContinue
                 }
                 Write-Host "   [+] Extended CMD Prompts Here Menu added." -ForegroundColor Green
             }
@@ -253,13 +351,13 @@ function Toggle-Mitigations {
     # Val 3 means mitigations are disabled
     if ($val -eq 3) {
         Write-Host "   [+] Enabling Spectre/Meltdown Mitigations (Secure)..." -ForegroundColor Green
-        Set-ItemProperty -Path $path -Name "FeatureSettingsOverride" -Value 0 -Type DWord -Force
-        Set-ItemProperty -Path $path -Name "FeatureSettingsOverrideMask" -Value 3 -Type DWord -Force
+        Set-ItemProperty -Path $path -Name "FeatureSettingsOverride" -Value 0 -Type DWord -Force | Out-Null
+        Set-ItemProperty -Path $path -Name "FeatureSettingsOverrideMask" -Value 3 -Type DWord -Force | Out-Null
         Write-Host "   [OK] CPU Mitigations ENABLED." -ForegroundColor Green
     } else {
         Write-Host "   [-] Disabling Spectre/Meltdown Mitigations (Fast)..." -ForegroundColor Yellow
-        Set-ItemProperty -Path $path -Name "FeatureSettingsOverride" -Value 3 -Type DWord -Force
-        Set-ItemProperty -Path $path -Name "FeatureSettingsOverrideMask" -Value 3 -Type DWord -Force
+        Set-ItemProperty -Path $path -Name "FeatureSettingsOverride" -Value 3 -Type DWord -Force | Out-Null
+        Set-ItemProperty -Path $path -Name "FeatureSettingsOverrideMask" -Value 3 -Type DWord -Force | Out-Null
         Write-Host "   [OK] CPU Mitigations DISABLED. Older CPUs will perform faster." -ForegroundColor Yellow
     }
     Write-Host "   [!] A SYSTEM REBOOT IS REQUIRED to apply these changes." -ForegroundColor Cyan
@@ -312,17 +410,55 @@ do {
     Write-Host "          WINDOWS LTSC & TWEAK TOOL        " -ForegroundColor White
     Write-Host "   ========================================" -ForegroundColor Cyan
 
-    # --- PERFORMANCE OPTIMIZATION: Cache the installed apps list ---
+    # --- PERFORMANCE OPTIMIZATION: Ultra-fast registry reading using .NET ---
     $installedAppsCache = @{}
-    $uninstallPaths = @(
-        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall", 
-        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
-        "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall" # Included for user-level installs
-    )
-    foreach ($path in $uninstallPaths) {
-        Get-ChildItem -Path $path -ErrorAction SilentlyContinue | ForEach-Object { 
-            $displayName = $_.GetValue("DisplayName")
-            if ($displayName) { $installedAppsCache[$displayName] = $true }
+    try {
+        $uninstallPaths = @(
+            "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall", 
+            "SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+        )
+        
+        # Fast read Local Machine
+        foreach ($subPath in $uninstallPaths) {
+            $regKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($subPath)
+            if ($regKey) {
+                foreach ($subKeyName in $regKey.GetSubKeyNames()) {
+                    $subKey = $regKey.OpenSubKey($subKeyName)
+                    if ($subKey) {
+                        $displayName = $subKey.GetValue("DisplayName")
+                        if ($displayName) { $installedAppsCache[$displayName] = $true }
+                        $subKey.Close()
+                    }
+                }
+                $regKey.Close()
+            }
+        }
+        
+        # Fast read Current User
+        $regKeyUser = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall")
+        if ($regKeyUser) {
+            foreach ($subKeyName in $regKeyUser.GetSubKeyNames()) {
+                $subKey = $regKeyUser.OpenSubKey($subKeyName)
+                if ($subKey) {
+                    $displayName = $subKey.GetValue("DisplayName")
+                    if ($displayName) { $installedAppsCache[$displayName] = $true }
+                    $subKey.Close()
+                }
+            }
+            $regKeyUser.Close()
+        }
+    } catch {
+        # Secure Fallback to slower native method if .NET access fails
+        $uninstallPathsFallback = @(
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall", 
+            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall"
+        )
+        foreach ($path in $uninstallPathsFallback) {
+            Get-ChildItem -Path $path -ErrorAction SilentlyContinue | ForEach-Object { 
+                $displayName = $_.GetValue("DisplayName")
+                if ($displayName) { $installedAppsCache[$displayName] = $true }
+            }
         }
     }
 

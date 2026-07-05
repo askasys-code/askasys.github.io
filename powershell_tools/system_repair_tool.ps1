@@ -8,17 +8,27 @@
 
 #region Setup, Encoding & Auto-Elevation
 # --- 1. GLOBAL SETTINGS ---
-# Set error preference
-$ErrorActionPreference = "SilentlyContinue"
+# Set error preference to Continue to avoid masking critical runtime script errors
+$ErrorActionPreference = "Continue"
 
 # Set Console Encoding to UTF-8
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-# Enable modern security protocols (TLS 1.2 & 1.3)
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+# Enable modern security protocols safely (TLS 1.2 as base, TLS 1.3 if supported by .NET)
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+if ([System.Enum]::IsDefined([Net.SecurityProtocolType], 'Tls13')) {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls13
+}
 
 # --- 2. ADMIN SELF-ELEVATION ---
-if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+# Check and enforce Administrator privileges at startup
+function Test-Administrator {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+if (-not (Test-Administrator)) {
     Write-Host "`n [!] Administrator privileges required." -ForegroundColor Yellow
     Write-Host " [!] Restarting as Administrator..." -ForegroundColor White
     
@@ -59,13 +69,14 @@ function Pause-Script {
 #endregion
 
 #region Core Utilities
-function Test-Administrator {
-    (New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
-}
-
 function Check-Internet {
     try {
-        Invoke-WebRequest -Uri "https://www.microsoft.com" -Method Head -TimeoutSec 10 -UseBasicParsing -ErrorAction Stop | Out-Null
+        # Perform a fast, lightweight HTTP HEAD request to Microsoft's official connectivity endpoint
+        $request = [System.Net.HttpWebRequest]::Create("http://www.msftconnecttest.com/connecttest.txt")
+        $request.Method = "HEAD"
+        $request.Timeout = 5000 # 5 seconds timeout
+        $response = $request.GetResponse()
+        $response.Close()
         return $true
     } catch {
         return $false
@@ -105,16 +116,27 @@ function Run-CHKDSK {
     Draw-Header "CHECK DISK UTILITY (CHKDSK)"
     
     Write-Host "Available Drives:" -ForegroundColor Cyan
-    $drives = Get-PSDrive -PSProvider FileSystem
+    $drives = Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue
     foreach ($d in $drives) {
-        Write-Host "  [$($d.Name)] Free: $([math]::round($d.Free/1GB,2)) GB" -ForegroundColor White
+        if ($d.Free -ne $null) {
+            Write-Host "  [$($d.Name)] Free: $([math]::round($d.Free/1GB,2)) GB" -ForegroundColor White
+        }
     }
     Write-Host ""
     
     $driveInput = Read-Host "  Select Drive Letter (Default: C)"
-    if ([string]::IsNullOrWhiteSpace($driveInput)) { $drive = "C:" } else { $drive = $driveInput.Substring(0,1).ToUpper() + ":" }
+    if ([string]::IsNullOrWhiteSpace($driveInput)) { 
+        $drive = "C:" 
+    } else { 
+        $cleanInput = $driveInput.Trim()
+        if ($cleanInput.Length -gt 0) {
+            $drive = $cleanInput.Substring(0,1).ToUpper() + ":"
+        } else {
+            $drive = "C:"
+        }
+    }
     
-    if (-not (Test-Path $drive)) {
+    if (-not (Test-Path $drive -ErrorAction SilentlyContinue)) {
         Write-Host "Error: Drive $drive not found." -ForegroundColor Red
         Pause-Script
         return
@@ -248,20 +270,7 @@ function Show-Menu {
 #endregion
 
 #region Script Initialization
-# Auto-elevate
-if (-not (Test-Administrator)) {
-    Write-Host "Requesting Administrator Privileges..." -ForegroundColor Yellow
-    try {
-        $scriptPath = $MyInvocation.MyCommand.Definition
-        Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`"" -Verb RunAs -ErrorAction Stop
-    } catch {
-        Write-Host "CRITICAL ERROR: Elevation failed." -ForegroundColor Red
-        Pause-Script
-    }
-    exit
-}
-
-# Loop
+# Main execution loop
 do {
     $selection = Show-Menu
     switch ($selection) {

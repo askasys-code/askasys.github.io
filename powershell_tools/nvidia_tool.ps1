@@ -8,8 +8,12 @@
 
 #region Setup, Encoding & Auto-Elevation
 # --- 1. GLOBAL SETTINGS ---
-# Set error preference
-$ErrorActionPreference = "SilentlyContinue"
+# We avoid global SilentlyContinue as it hides critical script errors. 
+# Instead, we handle issues gracefully using local ErrorActions or Try/Catch.
+$ErrorActionPreference = "Continue"
+
+# Set Console Title
+$Host.UI.RawUI.WindowTitle = "NVIDIA Optimization & Diagnostic Tool"
 
 # Set Console Encoding to UTF-8
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -23,10 +27,11 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
     Write-Host " [!] Restarting as Administrator..." -ForegroundColor White
     
     $scriptPath = $MyInvocation.MyCommand.Definition
+    $workingDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $scriptPath }
 
     try {
         # Restart the process as Admin, maintaining the current working directory
-        Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`"" -Verb RunAs -WorkingDirectory $PSScriptRoot
+        Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`"" -Verb RunAs -WorkingDirectory $workingDir
         Exit
     } catch {
         # If the user clicks "No" on the UAC prompt
@@ -36,16 +41,49 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 }
 #endregion
 
+# --- HELPER FUNCTIONS ---
+
 function Get-NvidiaSmi {
     $path = Get-Command "nvidia-smi" -ErrorAction SilentlyContinue
     if ($path) { return $path.Source }
-    $defaultPath = "C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe"
-    if (Test-Path $defaultPath) { return $defaultPath }
+    
+    # Common installation paths for nvidia-smi
+    $defaultPaths = @(
+        "C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe",
+        "C:\Windows\System32\nvidia-smi.exe"
+    )
+    foreach ($p in $defaultPaths) {
+        if (Test-Path $p) { return $p }
+    }
     return $null
 }
 
 function Get-InstalledDriverInfo {
     param($SmiPath)
+    
+    # Fallback to CIM if nvidia-smi is not found or fails
+    if (-not $SmiPath) {
+        try {
+            $gpu = Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop | Where-Object { $_.Name -like "*NVIDIA*" } | Select-Object -First 1
+            if ($gpu) {
+                # Format driver version to matching NVIDIA style (e.g. 31.0.15.5123 -> 551.23)
+                $rawVersion = $gpu.DriverVersion
+                $formattedVersion = $rawVersion
+                if ($rawVersion -match '(\d)\.(\d)(\d)(\d)(\d)$') {
+                    $formattedVersion = "$($Matches[1])$($Matches[2])$($Matches[3]).$($Matches[4])$($Matches[5])"
+                }
+                $vram = 0
+                if ($gpu.AdapterRAM) { $vram = [math]::Round($gpu.AdapterRAM / 1MB, 0) }
+                return @{ 
+                    Name    = $gpu.Name
+                    Version = $formattedVersion
+                    VRAM    = $vram
+                }
+            }
+        } catch {}
+        return @{ Name="NVIDIA Device (No SMI)"; Version="0.00"; VRAM="0" }
+    }
+
     try {
         $data = & $SmiPath --query-gpu=name,driver_version,memory.total --format=csv,noheader,nounits
         if ($data -is [array]) { $data = $data[0] }
@@ -60,7 +98,7 @@ function Get-LatestDriverFromTPU {
     Write-Host "Checking TechPowerUp for latest drivers..." -ForegroundColor DarkGray
     $url = "https://www.techpowerup.com/download/nvidia-geforce-graphics-drivers/"
     try {
-        $req = Invoke-WebRequest -Uri $url -UseBasicParsing -UserAgent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -TimeoutSec 5
+        $req = Invoke-WebRequest -Uri $url -UseBasicParsing -UserAgent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -TimeoutSec 5 -ErrorAction Stop
         if ($req.Content -match 'NVIDIA GeForce Graphics Drivers\s+(\d{3}\.\d{2})') { return $matches[1] }
         return "Unknown"
     } catch { return "Connection Error" }
@@ -96,13 +134,13 @@ function Get-VrrStatus {
 
 function Get-TelemetryStatus {
     $tasks = @("NvTmMon", "NvTmRep", "NvTmRepOnLogon", "NvProfileUpdaterOnLogon")
-    foreach ($t in $tasks) {
-        $obj = Get-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue
-        if ($obj -and $obj.State -ne "Disabled") {
-            return $true # At least one is enabled
-        }
+    # Query all tasks in a single fast batch query rather than looping Get-ScheduledTask
+    $scheduledTasks = Get-ScheduledTask -TaskName $tasks -ErrorAction SilentlyContinue
+    if ($scheduledTasks) {
+        $anyEnabled = $scheduledTasks | Where-Object { $_.State -ne "Disabled" }
+        if ($anyEnabled) { return $true }
     }
-    return $false # All are disabled or not found
+    return $false
 }
 
 function Get-DlssIndicatorStatus {
@@ -121,6 +159,11 @@ function Get-DlssIndicatorStatus {
 
 function Show-Dashboard {
     param($SmiPath)
+    if (-not $SmiPath) {
+        Write-Host "NVIDIA-SMI is required for Dashboard monitoring." -ForegroundColor Red
+        Pause
+        return
+    }
     try { & $SmiPath -L | Out-Null } catch { Write-Host "NVIDIA-SMI failed." -ForegroundColor Red; Pause; return }
     $running = $true
     $deg = [char]0x00B0 
@@ -135,7 +178,9 @@ function Show-Dashboard {
         try {
             $cmdOutput = & $SmiPath --query-gpu=temperature.gpu,fan.speed,power.draw,power.limit,utilization.gpu,memory.used,memory.total,clocks.gr,clocks.mem --format=csv,noheader,nounits
             if ($cmdOutput -is [array]) { $cmdOutput = $cmdOutput[0] }
-            $stats = $cmdOutput -split ',' | ForEach-Object { $_.Trim() }
+            
+            # Optimized split and trim via member enumeration (much faster than ForEach-Object in high-frequency loops)
+            $stats = ($cmdOutput -split ',').Trim()
             
             $GetVal = { param($idx) if ($stats.Count -gt $idx -and $stats[$idx] -ne "[Not Supported]") { return $stats[$idx] } else { return "0" } }
 
@@ -187,8 +232,8 @@ function Toggle-HAGS {
     $name = "HwSchMode"
     $status = Get-HagsStatus
     
-    # Ensure path exists
-    if (-not (Test-Path $path)) { New-Item -Path $path -Force | Out-Null }
+    # Ensure path exists safely (avoiding -Force on New-Item to prevent sibling value erasure)
+    if (-not (Test-Path $path)) { New-Item -Path $path -ErrorAction SilentlyContinue | Out-Null }
 
     if ($status) {
         # Turn OFF (Value 1)
@@ -207,8 +252,8 @@ function Toggle-VRR {
     $path = "HKCU:\Software\Microsoft\DirectX\UserGpuPreferences"
     $name = "DirectXUserGlobalSettings"
     
-    # Ensure key exists
-    if (-not (Test-Path $path)) { New-Item -Path $path -Force | Out-Null }
+    # Ensure path exists safely (avoiding -Force on New-Item to prevent sibling value erasure)
+    if (-not (Test-Path $path)) { New-Item -Path $path -ErrorAction SilentlyContinue | Out-Null }
 
     # Read current string value safely
     $currentVal = (Get-ItemProperty -Path $path -Name $name -ErrorAction SilentlyContinue).$name
@@ -234,7 +279,7 @@ function Toggle-VRR {
             $newVal = $currentVal -replace "VRROptimizeEnable=0", "VRROptimizeEnable=1"
             Set-ItemProperty -Path $path -Name $name -Value $newVal -Type String -Force
         } elseif ($currentVal -match "VRROptimizeEnable=1") {
-            # Already enabled in string, maybe glitch? Force write anyway.
+            # Already enabled in string, force write anyway
             Set-ItemProperty -Path $path -Name $name -Value $currentVal -Type String -Force
         } else {
             # Not present, append it. Clean up double semicolons.
@@ -251,19 +296,21 @@ function Toggle-Telemetry {
     $tasks = @("NvTmMon", "NvTmRep", "NvTmRepOnLogon", "NvProfileUpdaterOnLogon")
     $status = Get-TelemetryStatus
 
+    # Optimize query by getting scheduled tasks in one batch
+    $scheduledTasks = Get-ScheduledTask -TaskName $tasks -ErrorAction SilentlyContinue
+    if (-not $scheduledTasks) {
+        Write-Host "`n [!] No NVIDIA Telemetry tasks found on this system." -ForegroundColor Yellow
+        Start-Sleep -Seconds 1.5
+        return
+    }
+
     if ($status) {
         # Disable
-        foreach ($t in $tasks) {
-            $obj = Get-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue
-            if ($obj) { Disable-ScheduledTask -TaskName $t | Out-Null }
-        }
+        $scheduledTasks | Disable-ScheduledTask | Out-Null
         Write-Host "`n [TOGGLE] NVIDIA Telemetry Tasks DISABLED." -ForegroundColor Green
     } else {
         # Enable
-        foreach ($t in $tasks) {
-            $obj = Get-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue
-            if ($obj) { Enable-ScheduledTask -TaskName $t | Out-Null }
-        }
+        $scheduledTasks | Enable-ScheduledTask | Out-Null
         Write-Host "`n [TOGGLE] NVIDIA Telemetry Tasks ENABLED." -ForegroundColor Red
     }
     Start-Sleep -Seconds 1
@@ -274,8 +321,8 @@ function Toggle-DlssIndicator {
     $name = "ShowDlssIndicator"
     $status = Get-DlssIndicatorStatus
 
-    # Ensure path exists
-    if (-not (Test-Path $path)) { New-Item -Path $path -Force | Out-Null }
+    # Ensure path exists safely (avoiding -Force on New-Item to prevent sibling value erasure)
+    if (-not (Test-Path $path)) { New-Item -Path $path -ErrorAction SilentlyContinue | Out-Null }
 
     if ($status) {
         # Turn OFF
@@ -295,16 +342,23 @@ function Disable-GameBarWriter {
     Write-Host "Fixes conflicts between Xbox overlay and NVIDIA overlay." -ForegroundColor Gray
     
     try {
-        # 1. Registry Policies
+        # 1. Registry Policies (System Wide)
         $reg = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\GameDVR"
-        if (-not (Test-Path $reg)) { New-Item -Path $reg -Force | Out-Null }
+        if (-not (Test-Path $reg)) { New-Item -Path $reg -ErrorAction SilentlyContinue | Out-Null }
         Set-ItemProperty -Path $reg -Name "AllowGameDVR" -Value 0 -Type DWord -Force
         
+        # 2. Registry Policies (User Specific)
         $regUser = "HKCU:\System\GameConfigStore"
-        if (-not (Test-Path $regUser)) { New-Item -Path $regUser -Force | Out-Null }
+        if (-not (Test-Path $regUser)) { New-Item -Path $regUser -ErrorAction SilentlyContinue | Out-Null }
         Set-ItemProperty -Path $regUser -Name "GameDVR_Enabled" -Value 0 -Type DWord -Force
+        Set-ItemProperty -Path $regUser -Name "GameDVR_FSEBehaviorMode" -Value 2 -Type DWord -Force
 
-        # 2. Stop Process
+        # 3. Disable App Capture Components (User Specific)
+        $regDVRUser = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\GameDVR"
+        if (-not (Test-Path $regDVRUser)) { New-Item -Path $regDVRUser -ErrorAction SilentlyContinue | Out-Null }
+        Set-ItemProperty -Path $regDVRUser -Name "AppCaptureEnabled" -Value 0 -Type DWord -Force
+
+        # 4. Stop Process if Running
         $proc = Get-Process "GameBarPresenceWriter" -ErrorAction SilentlyContinue
         if ($proc) { 
             Stop-Process -InputObject $proc -Force
@@ -351,10 +405,16 @@ function Clean-Caches {
                 if ($ask.ToLower() -eq "y") {
                     $removedCount = 0
                     foreach ($file in $files) { 
-                        try { Remove-Item -Path $file.FullName -Force -ErrorAction Stop; $removedCount++ } catch {} 
+                        try { 
+                            Remove-Item -Path $file.FullName -Force -ErrorAction Stop
+                            $removedCount++ 
+                        } catch {} 
                     }
-                    if ($removedCount -eq $count) { Write-Host "    [SUCCESS] Cleaned." -ForegroundColor Green }
-                    else { Write-Host "    [PARTIAL] Cleaned ($removedCount/$count)." -ForegroundColor Yellow }
+                    if ($removedCount -eq $count) { 
+                        Write-Host "    [SUCCESS] Cleaned." -ForegroundColor Green 
+                    } else { 
+                        Write-Host "    [PARTIAL] Cleaned ($removedCount/$count). Some files may be in use by the system or running apps." -ForegroundColor Yellow 
+                    }
                 } else {
                     Write-Host "    Skipped." -ForegroundColor DarkGray
                 }
@@ -368,40 +428,56 @@ function Clean-Caches {
 function Set-EcoMode {
     param($SmiPath)
     Write-Host "`n=== Eco Mode Setup (50%) ===" -ForegroundColor Cyan
+    if (-not $SmiPath) {
+        Write-Host "NVIDIA-SMI is required to configure power limit features." -ForegroundColor Red
+        Pause
+        return
+    }
     try {
         $max = & $SmiPath --query-gpu=power.max_limit --format=csv,noheader,nounits
         $min = & $SmiPath --query-gpu=power.min_limit --format=csv,noheader,nounits
-        if ($max -eq "[Not Supported]" -or $null -eq $max) { Write-Host "Not Supported." -ForegroundColor Red; Pause; return }
+        if ($max -eq "[Not Supported]" -or $null -eq $max) { Write-Host "Not Supported by this GPU model." -ForegroundColor Red; Pause; return }
         $target = [math]::Round([double]$max * 0.50)
         if ($target -lt [double]$min) { $target = [double]$min; Write-Host "Adjusted to hardware min: $target W" -ForegroundColor Yellow }
+        
+        # Capture actual execution exit code (PowerShell does not throw exceptions on external process failures)
         & $SmiPath -pl $target
-        Write-Host "Limit set to $target W." -ForegroundColor Green
-    } catch { Write-Host "Failed." -ForegroundColor Red }
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "Failed to apply power limit. Changes may be locked on this system (common on laptop GPUs)." -ForegroundColor Red
+        } else {
+            Write-Host "Limit set to $target W." -ForegroundColor Green
+        }
+    } catch { Write-Host "Failed to query or adjust limit." -ForegroundColor Red }
     Pause
 }
 
 function Set-MaxMode {
     param($SmiPath)
     Write-Host "`n=== Max Performance Setup ===" -ForegroundColor Cyan
+    if (-not $SmiPath) {
+        Write-Host "NVIDIA-SMI is required to configure power limit features." -ForegroundColor Red
+        Pause
+        return
+    }
     try {
         $max = & $SmiPath --query-gpu=power.max_limit --format=csv,noheader,nounits
-        if ($max -eq "[Not Supported]") { Write-Host "Not Supported." -ForegroundColor Red; Pause; return }
+        if ($max -eq "[Not Supported]") { Write-Host "Not Supported by this GPU model." -ForegroundColor Red; Pause; return }
+        
+        # Capture actual execution exit code (PowerShell does not throw exceptions on external process failures)
         & $SmiPath -pl $max
-        Write-Host "Limit restored to $max W." -ForegroundColor Green
-    } catch { Write-Host "Failed." -ForegroundColor Red }
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "Failed to apply power limit. Changes may be locked on this system." -ForegroundColor Red
+        } else {
+            Write-Host "Limit restored to $max W." -ForegroundColor Green
+        }
+    } catch { Write-Host "Failed to query or adjust limit." -ForegroundColor Red }
     Pause
 }
 
 # --- MAIN LOGIC ---
 
-if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Definition)`"" -Verb RunAs
-    exit
-}
-
 $smi = Get-NvidiaSmi
-if (-not $smi) { Write-Host "NVIDIA Driver not found." -ForegroundColor Red; Pause; exit }
-
+# We fall back to standard CIM querying if nvidia-smi is not available
 Write-Host "Initializing Nvidia Tool..." -ForegroundColor Green
 $localInfo = Get-InstalledDriverInfo -SmiPath $smi
 $latestVer = "Check Required"

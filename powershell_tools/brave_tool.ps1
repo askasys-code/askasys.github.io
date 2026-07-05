@@ -24,6 +24,12 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
     
     $scriptPath = $MyInvocation.MyCommand.Definition
 
+    # Verify that the script has been saved to a file before attempting elevation
+    if ([string]::IsNullOrEmpty($scriptPath) -or -not (Test-Path $scriptPath)) {
+        Write-Host " [X] Please save this script as a .ps1 file before running it." -ForegroundColor Red
+        Exit
+    }
+
     try {
         # Restart the process as Admin, maintaining the current working directory
         Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`"" -Verb RunAs -WorkingDirectory $PSScriptRoot
@@ -50,7 +56,72 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 if (-not (Test-Path $RegistryPath)) { New-Item -Path $RegistryPath -Force | Out-Null }
 
 # ---------------------------------------------------------------------------
-# FUNCTIONS
+# HELPER FUNCTIONS (OPTIMIZED TRAVERSAL & PERFORMANCE)
+# ---------------------------------------------------------------------------
+
+# Optimized BFS directory file listing that completely bypasses excluded folders.
+# This avoids scanning millions of cache files, making search operations significantly faster.
+function Get-FilesToBackup {
+    param (
+        [string]$RootPath,
+        [string[]]$Excludes
+    )
+    $files = [System.Collections.Generic.List[System.IO.FileInfo]]::new()
+    if (-not (Test-Path $RootPath)) { return $files }
+    
+    $queue = [System.Collections.Generic.Queue[string]]::new()
+    $queue.Enqueue($RootPath)
+
+    while ($queue.Count -gt 0) {
+        $current = $queue.Dequeue()
+        try {
+            $dirInfo = [System.IO.DirectoryInfo]::new($current)
+            if ($dirInfo.Exists) {
+                $files.AddRange($dirInfo.GetFiles())
+                foreach ($subDir in $dirInfo.GetDirectories()) {
+                    # Skip traversal into excluded directory structures entirely
+                    if ($Excludes -notcontains $subDir.Name) {
+                        $queue.Enqueue($subDir.FullName)
+                    }
+                }
+            }
+        } catch {
+            # Safely catch and skip system locks or access errors
+        }
+    }
+    return $files
+}
+
+# Rapid folder size calculation using native .NET directory info instead of heavy PowerShell pipeline
+function Get-FolderSizeSafe {
+    param ([string]$Path)
+    $totalBytes = 0
+    if (-not (Test-Path $Path)) { return 0 }
+    
+    $queue = [System.Collections.Generic.Queue[string]]::new()
+    $queue.Enqueue($Path)
+
+    while ($queue.Count -gt 0) {
+        $current = $queue.Dequeue()
+        try {
+            $dirInfo = [System.IO.DirectoryInfo]::new($current)
+            if ($dirInfo.Exists) {
+                foreach ($f in $dirInfo.GetFiles()) {
+                    $totalBytes += $f.Length
+                }
+                foreach ($subDir in $dirInfo.GetDirectories()) {
+                    $queue.Enqueue($subDir.FullName)
+                }
+            }
+        } catch {
+            # Ignore transient file locking issues during size reading
+        }
+    }
+    return $totalBytes
+}
+
+# ---------------------------------------------------------------------------
+# MAIN SCRIPT FUNCTIONS
 # ---------------------------------------------------------------------------
 
 function Close-Brave {
@@ -96,9 +167,7 @@ function Get-CurrentCacheSize {
     # 1. Global Caches (User Data Root)
     $GlobalPaths = @("$BraveUserDataPath\ShaderCache", "$BraveUserDataPath\GrShaderCache")
     foreach ($gp in $GlobalPaths) {
-        if (Test-Path $gp) {
-            $totalBytes += (Get-ChildItem -Path $gp -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
-        }
+        $totalBytes += Get-FolderSizeSafe -Path $gp
     }
 
     # 2. Per-Profile Caches (Default, Profile 1, Profile 2...)
@@ -113,9 +182,7 @@ function Get-CurrentCacheSize {
                 "$($p.FullName)\Service Worker"
             )
             foreach ($sp in $SubPaths) {
-                if (Test-Path $sp) {
-                    $totalBytes += (Get-ChildItem -Path $sp -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
-                }
+                $totalBytes += Get-FolderSizeSafe -Path $sp
             }
         }
     }
@@ -163,17 +230,22 @@ function Clean-Cache {
 
     # 2. Execute Cleaning
     foreach ($path in $PathsToClean) {
+        $shortName = $path.Replace($BraveUserDataPath, "User Data")
         try {
-            # Check if files exist
-            $files = Get-ChildItem -Path $path -Recurse -Force -ErrorAction SilentlyContinue
-            if ($files) {
-                # Format path for display (Shorten User Data path)
-                $shortName = $path.Replace($BraveUserDataPath, "User Data")
-                Remove-Item -Path "$path\*" -Recurse -Force -ErrorAction Stop
+            if (Test-Path $path) {
+                # Attempt highly efficient .NET recursive directory removal
+                [System.IO.Directory]::Delete($path, $true)
+                [System.IO.Directory]::CreateDirectory($path) | Out-Null
                 Write-Host "   [CLEANED] $shortName" -ForegroundColor Green
             }
         } catch {
-            Write-Host "   [LOCKED]  $($path | Split-Path -Leaf)" -ForegroundColor DarkGray
+            # Fallback block to individually delete files if some items remain strictly locked
+            try {
+                Remove-Item -Path "$path\*" -Recurse -Force -ErrorAction SilentlyContinue
+                Write-Host "   [PARTIALLY CLEANED] $shortName" -ForegroundColor Yellow
+            } catch {
+                Write-Host "   [LOCKED]  $($path | Split-Path -Leaf)" -ForegroundColor DarkGray
+            }
         }
     }
     
@@ -201,23 +273,8 @@ function Start-Backup {
     try {
         Write-Host "   Indexing files... (Please wait)" -ForegroundColor DarkCyan
         
-        # 1. Gather all files first to calculate percentage
-        $AllFiles = Get-ChildItem -Path $BraveUserDataPath -Recurse -File -Force -ErrorAction SilentlyContinue
-        $FilesToZip = @()
-
-        foreach ($file in $AllFiles) {
-            # Check if file path contains any excluded folder
-            $shouldExclude = $false
-            foreach ($ex in $ExcludeList) {
-                if ($file.FullName -match "\\$ex\\") { 
-                    $shouldExclude = $true 
-                    break 
-                }
-            }
-            if (-not $shouldExclude) {
-                $FilesToZip += $file
-            }
-        }
+        # 1. Gather files efficiently using our optimized BFS search (skips entering excluded folders)
+        $FilesToZip = Get-FilesToBackup -RootPath $BraveUserDataPath -Excludes $ExcludeList
 
         $TotalCount = $FilesToZip.Count
         if ($TotalCount -eq 0) { Write-Host "   [ERROR] No files found to backup." -ForegroundColor Red; return }

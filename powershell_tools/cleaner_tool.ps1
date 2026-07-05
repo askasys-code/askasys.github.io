@@ -15,7 +15,7 @@ $ErrorActionPreference = "SilentlyContinue"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 # Enable modern security protocols (TLS 1.2 & 1.3)
-[Net.ServicePointManager]::SecurityProtocol =[Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
 
 # --- 2. ADMIN SELF-ELEVATION ---
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -49,9 +49,10 @@ function Get-PathSize {
     param ([string[]]$Paths)
     $total = 0
     foreach ($p in $Paths) {
-        if (Test-Path $p) {
-            $measure = Get-ChildItem -Path $p -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
-            if ($measure) { $total += $measure.Sum }
+        if (Test-Path -LiteralPath $p) {
+            # Optimized parsing avoiding symlink loops and handling nulls safely with -LiteralPath
+            $measure = Get-ChildItem -LiteralPath $p -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
+            if ($null -ne $measure -and $null -ne $measure.Sum) { $total += $measure.Sum }
         }
     }
     return $total
@@ -60,7 +61,9 @@ function Get-PathSize {
 function Get-RecycleBinSize {
     try {
         $bin = (New-Object -ComObject Shell.Application).NameSpace(0xA)
-        return ($bin.Items() | Measure-Object -Property Size -Sum).Sum
+        $measure = $bin.Items() | Measure-Object -Property Size -Sum
+        if ($null -ne $measure -and $null -ne $measure.Sum) { return $measure.Sum }
+        return 0
     } catch {
         return 0
     }
@@ -94,7 +97,7 @@ function Invoke-OriginalTempCleanup {
     Remove-Item -Path "C:\Windows\System32\LogFiles\*.log" -Recurse -Force -ErrorAction SilentlyContinue
 
     Write-Host "`n[OK] Cleanup Complete." -ForegroundColor Green
-    Pause-Script
+    if ($args[0] -ne "-NoPause") { Pause-Script }
 }
 #endregion
 
@@ -120,7 +123,7 @@ function Invoke-OriginalUpdateStore {
     Start-Process -FilePath "wsreset.exe" -NoNewWindow -Wait
 
     Write-Host "`n[OK] Update & Store Reset Complete." -ForegroundColor Green
-    Pause-Script
+    if ($args[0] -ne "-NoPause") { Pause-Script }
 }
 #endregion
 
@@ -137,28 +140,29 @@ function Invoke-OriginalWinSxS {
     } else {
         Write-Host "`n[!] WinSxS cleanup issues detected." -ForegroundColor Red
     }
-    Pause-Script
+    if ($args[0] -ne "-NoPause") { Pause-Script }
 }
 #endregion
 
-#region Function Group 4: Thumbnail Cache (Original Function 3)
+#region Function Group 4: Thumbnail Cache (Original Function 3 - Safe Non-Intrusive Cleaning)
 function Invoke-OriginalThumbnails {
     Write-Host "`n=== Clear Thumbnail Cache ===" -ForegroundColor Cyan
     Write-Host "Clearing thumbnail cache..." -ForegroundColor Yellow
     
     $thumbCachePath = "$env:LOCALAPPDATA\Microsoft\Windows\Explorer"
-    if (Test-Path $thumbCachePath) {
-        # Note: Some files may be locked if Explorer is running, but we stick to original logic
-        Get-ChildItem -Path $thumbCachePath -Filter "thumbcache_*.db" | Remove-Item -Force -ErrorAction SilentlyContinue
-        Write-Host "Thumbnail cache cleared." -ForegroundColor Green
+    if (Test-Path -LiteralPath $thumbCachePath) {
+        # Original cleaning logic preserved with literal path processing.
+        # No process termination is used to prevent interface flashing; locked files are skipped.
+        Get-ChildItem -LiteralPath $thumbCachePath -Filter "thumbcache_*.db" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+        Write-Host "Thumbnail cache cleared (locked files skipped)." -ForegroundColor Green
     } else {
         Write-Host "Thumbnail cache path not found." -ForegroundColor Red
     }
-    Pause-Script
+    if ($args[0] -ne "-NoPause") { Pause-Script }
 }
 #endregion
 
-#region Function Group 5: Clipboard, Snipping Tool & Extra Temp
+#region Function Group 5: Clipboard, Snipping Tool & Extra Temp (IIS Logs & Minidumps Included)
 function Invoke-ExtraCleanup {
     Write-Host "`n=== Cleaning Clipboard, ScreenClips & Extra Temp ===" -ForegroundColor Cyan
     
@@ -197,7 +201,49 @@ function Invoke-ExtraCleanup {
     Clear-DnsClientCache -ErrorAction SilentlyContinue
     ipconfig /flushdns | Out-Null
 
+    # Step 8: IIS HTTPERR Logs & System Minidumps (Safe additions)
+    Write-Host "8. Cleaning IIS HTTPERR Logs & Minidumps..." -ForegroundColor Yellow
+    Remove-Item -Path "C:\Windows\System32\LogFiles\HTTPERR\*" -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path "C:\Windows\Minidump\*" -Recurse -Force -ErrorAction SilentlyContinue
+
     Write-Host "`n[OK] Extra Cleanup Complete." -ForegroundColor Green
+    if ($args[0] -ne "-NoPause") { Pause-Script }
+}
+#endregion
+
+#region Function Group 6: Modern Deep System, DO Cache & Event Logs (Excludes GPU Shader Caches)
+function Invoke-DeepSystemCleanup {
+    Write-Host "`n=== Deep System, DO Cache & Event Logs Cleanup ===" -ForegroundColor Cyan
+    
+    # Step 1: Windows Delivery Optimization (DO) Cache
+    Write-Host "1. Cleaning Delivery Optimization Cache..." -ForegroundColor Yellow
+    Remove-Item -Path "C:\Windows\ServiceProfiles\NetworkService\AppData\Local\Microsoft\Windows\DeliveryOptimization\Cache\*" -Recurse -Force -ErrorAction SilentlyContinue
+
+    # Step 2: Windows Defender Scan Detection History
+    Write-Host "2. Cleaning Windows Defender Detection History..." -ForegroundColor Yellow
+    Remove-Item -Path "C:\ProgramData\Microsoft\Windows Defender\Scans\History\Service\DetectionHistory\*" -Recurse -Force -ErrorAction SilentlyContinue
+
+    # Step 3: Windows Event Viewer Logs
+    Write-Host "3. Clearing Windows Event Viewer Logs..." -ForegroundColor Yellow
+    Get-WinEvent -ListLog * -Force -ErrorAction SilentlyContinue | Where-Object { $_.RecordCount -gt 0 } | ForEach-Object {
+        wevtutil.exe cl $_.LogName 2>&1 | Out-Null
+    }
+
+    Write-Host "`n[OK] Deep System Cleanup Complete." -ForegroundColor Green
+    if ($args[0] -ne "-NoPause") { Pause-Script }
+}
+#endregion
+
+#region Function Group 7: Run All Tasks
+function Invoke-AllCleanups {
+    Write-Host "`n=== Running Comprehensive System Clean ===" -ForegroundColor Magenta
+    Invoke-OriginalTempCleanup -NoPause
+    Invoke-OriginalUpdateStore -NoPause
+    Invoke-OriginalWinSxS -NoPause
+    Invoke-OriginalThumbnails -NoPause
+    Invoke-ExtraCleanup -NoPause
+    Invoke-DeepSystemCleanup -NoPause
+    Write-Host "`n[ALL TASKS COMPLETED] System fully cleaned and optimized." -ForegroundColor Green
     Pause-Script
 }
 #endregion
@@ -212,7 +258,7 @@ do {
     Write-Host "   =========================================" -ForegroundColor Cyan
     Write-Host "   Analyzing current usage... Please wait." -ForegroundColor DarkGray
 
-    # --- Analysis Phase (Mapping to Original Paths) ---
+    # --- Analysis Phase (Mapping to Original & New Paths) ---
     
     # Group 1: Temp, Logs, Bin
     $pathsGroup1 = @(
@@ -234,7 +280,7 @@ do {
     $pathGroup4 = @("$env:LOCALAPPDATA\Microsoft\Windows\Explorer")
     $sizeGroup4 = Get-PathSize $pathGroup4
 
-    # Group 5: Clipboard, Snipping Tool & Extra Temp
+    # Group 5: Clipboard, Snipping Tool & Extra Temp (Includes HTTPERR and Minidump)
     $pathsGroup5 = @(
         "$env:LOCALAPPDATA\Packages\MicrosoftWindows.Client.Core_cw5n1h2txyewy\TempState\ScreenClip",
         "$env:LOCALAPPDATA\Packages\Microsoft.ScreenSketch_8wekyb3d8bbwe\TempState",
@@ -243,9 +289,18 @@ do {
         "C:\ProgramData\Microsoft\Windows\WER\ReportArchive",
         "C:\ProgramData\Microsoft\Windows\WER\ReportQueue",
         "$env:APPDATA\Microsoft\Windows\Recent",
-        "$env:LOCALAPPDATA\Microsoft\Windows\INetCache"
+        "$env:LOCALAPPDATA\Microsoft\Windows\INetCache",
+        "C:\Windows\System32\LogFiles\HTTPERR",
+        "C:\Windows\Minidump"
     )
     $sizeGroup5 = Get-PathSize $pathsGroup5
+
+    # Group 6: Modern Deep System, DO Cache (GPU Shaders are excluded)
+    $pathsGroup6 = @(
+        "C:\Windows\ServiceProfiles\NetworkService\AppData\Local\Microsoft\Windows\DeliveryOptimization\Cache",
+        "C:\ProgramData\Microsoft\Windows Defender\Scans\History\Service\DetectionHistory"
+    )
+    $sizeGroup6 = Get-PathSize $pathsGroup6
 
     Clear-Host
     Write-Host "   =========================================" -ForegroundColor Cyan
@@ -261,7 +316,8 @@ do {
         @{ ID="2"; Name="Windows Update & Store Cache";   Size=(Format-ByteSize $sizeGroup2); Color="Green" },
         @{ ID="3"; Name="WinSxS Component Store";         Size="[Optimization Action]";       Color="Gray" },
         @{ ID="4"; Name="Thumbnail Cache";                Size=(Format-ByteSize $sizeGroup4); Color="Green" },
-        @{ ID="5"; Name="Clipboard, ScreenClips & Extra"; Size=(Format-ByteSize $sizeGroup5); Color="Green" }
+        @{ ID="5"; Name="Clipboard, ScreenClips & Extra"; Size=(Format-ByteSize $sizeGroup5); Color="Green" },
+        @{ ID="6"; Name="Deep System, DO & Event Logs";   Size=(Format-ByteSize $sizeGroup6); Color="Green" }
     )
 
     # Display Menu
@@ -276,6 +332,7 @@ do {
     }
 
     Write-Host ""
+    Write-Host "   [A] Run All Cleaning Tasks" -ForegroundColor Magenta
     Write-Host "   [X] Exit" -ForegroundColor White
     Write-Host ""
     
@@ -287,6 +344,8 @@ do {
         "3" { Invoke-OriginalWinSxS }
         "4" { Invoke-OriginalThumbnails }
         "5" { Invoke-ExtraCleanup }
+        "6" { Invoke-DeepSystemCleanup }
+        { $_ -eq "a" -or $_ -eq "A" } { Invoke-AllCleanups }
         { $_ -eq "x" -or $_ -eq "X" } { exit }
         Default { Write-Host "   Invalid selection." -ForegroundColor Red; Start-Sleep 1 }
     }
