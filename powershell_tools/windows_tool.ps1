@@ -1,10 +1,10 @@
-﻿# REQUIRES: Administrator Privileges
+# REQUIRES: Administrator Privileges
 # COMPATIBILITY: PowerShell 5.1+ / Windows 11 IoT LTSC
 # CODING STANDARD: All internal comments must be written in ENGLISH.
 
 <#
     Windows Tweaks & Optimization Tool
-    Updated: 2026-07-05
+    Updated: 2026-07-10
     Description: General toolbox for UI, Context Menus, Apps, and CPU performance tweaks.
 #>
 
@@ -47,6 +47,127 @@ if (-not $isAdmin) {
 # ---------------------------------------------------------------------------
 # HELPERS: STATUS CHECKS
 # ---------------------------------------------------------------------------
+
+function Get-WindowsVersion {
+    # Fetch official OS name from WMI/CIM first (correctly resolves Win 11 vs Win 10 branding)
+    $Caption = (Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption
+    if ($Caption) {
+        $ProductName = $Caption -replace '^Microsoft\s+', ''
+    } else {
+        # Fallback to registry if CIM fails
+        $ProductName = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -ErrorAction SilentlyContinue).ProductName
+    }
+    
+    $CurrentBuild = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -ErrorAction SilentlyContinue).CurrentBuild
+    $buildNum = 0
+    [void][int]::TryParse($CurrentBuild, [ref]$buildNum)
+    
+    # Correct Windows 10 vs 11 branding mismatches in registry/WMI for newer builds (Build 22000+)
+    if ($ProductName -match "Windows 10" -and $buildNum -ge 22000) {
+        $ProductName = $ProductName -replace "Windows 10", "Windows 11"
+    }
+
+    $DisplayVersion = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -ErrorAction SilentlyContinue).DisplayVersion
+    if (-not $DisplayVersion) {
+        $DisplayVersion = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -ErrorAction SilentlyContinue).ReleaseId
+    }
+    if (-not $DisplayVersion) { $DisplayVersion = "N/A" }
+
+    $UBR = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -ErrorAction SilentlyContinue).UBR
+    $buildString = if ($UBR) { "$CurrentBuild.$UBR" } else { "$CurrentBuild" }
+    
+    if (-not $ProductName) {
+        return "Unknown Windows Version"
+    }
+    return "$ProductName ($DisplayVersion - Build $buildString)"
+}
+
+function Get-LicenseStatus {
+    $status = "NOT ACTIVATED / UNKNOWN"
+    $color = "DarkGray"
+    $key = "N/A"
+    $type = "Unknown"
+    
+    try {
+        $license = Get-CimInstance -ClassName SoftwareLicensingProduct -Filter "Name like 'Windows%' and PartialProductKey is not null" -ErrorAction SilentlyContinue
+        if ($license) {
+            $licObj = $license | Select-Object -First 1
+            $partialKey = $licObj.PartialProductKey
+            
+            # Determine Activation Status
+            switch ($licObj.LicenseStatus) {
+                1 { $status = "ACTIVATED"; $color = "Green" }
+                2 { $status = "GRACE PERIOD (OOB)"; $color = "Yellow" }
+                3 { $status = "GRACE PERIOD (OOT)"; $color = "Yellow" }
+                4 { $status = "NON-GENUINE GRACE"; $color = "Red" }
+                5 { $status = "NOTIFICATION"; $color = "Red" }
+                6 { $status = "EXTENDED GRACE"; $color = "Yellow" }
+                Default { $status = "UNLICENSED"; $color = "Red" }
+            }
+            
+            # Determine License Channel/Type
+            $channel = $licObj.ProductKeyChannel
+            if (-not $channel) {
+                $desc = $licObj.Description
+                if ($desc -match "VOLUME_KMSCLIENT|KMS") { $channel = "Volume (KMS)" }
+                elseif ($desc -match "VOLUME_MAK|MAK") { $channel = "Volume (MAK)" }
+                elseif ($desc -match "OEM") { $channel = "OEM" }
+                elseif ($desc -match "RETAIL") { $channel = "Retail" }
+                else { $channel = "Unknown Channel" }
+            }
+            
+            if ($channel -match "Retail") { $type = "Retail" }
+            elseif ($channel -match "OEM") { $type = "OEM" }
+            elseif ($channel -match "KMS|VOLUME_KMS") { $type = "Volume (KMS)" }
+            elseif ($channel -match "MAK|VOLUME_MAK") { $type = "Volume (MAK)" }
+            else { $type = $channel }
+
+            # Retrieve Backup registry Product Key if available
+            $fullKey = (Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SoftwareProtectionPlatform" -Name "BackupProductKeyDefault" -ErrorAction SilentlyContinue).BackupProductKeyDefault
+            
+            # Retrieve Bios embedded Product Key (OEM Key)
+            $oemKey = (Get-CimInstance SoftwareLicensingService -ErrorAction SilentlyContinue).OA3xOriginalProductKey
+            
+            if ($fullKey -and $fullKey -ne "BBBBB-BBBBB-BBBBB-BBBBB-BBBBB") {
+                $key = $fullKey
+            } elseif ($oemKey) {
+                $key = "$oemKey (BIOS)"
+            } elseif ($partialKey) {
+                $key = "Partial Key: $partialKey"
+            }
+        }
+    } catch {}
+    
+    return @{ 
+        Status = $status
+        Color = $color
+        Key = $key
+        Type = $type
+    }
+}
+
+function Get-UpdateStatus {
+    $service = Get-Service -Name "wuauserv" -ErrorAction SilentlyContinue
+    $regPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU"
+    $regValue = $null
+    
+    try {
+        $regKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU")
+        if ($regKey) {
+            $regValue = $regKey.GetValue("NoAutoUpdate")
+            $regKey.Close()
+        }
+    } catch {}
+
+    if ($regValue -eq $null) {
+        $regValue = (Get-ItemProperty -Path $regPath -Name "NoAutoUpdate" -ErrorAction SilentlyContinue).NoAutoUpdate
+    }
+    
+    if (($service -and $service.StartType -eq "Disabled") -or $regValue -eq 1) {
+        return @{ Text="DISABLED"; Color="Red" }
+    }
+    return @{ Text="ACTIVE   "; Color="Green" }
+}
 
 function Get-RegistryStatus {
     param ([string]$Path, [string]$Name, [int]$TargetValue)
@@ -168,6 +289,48 @@ function Get-ComponentStatus {
 # ---------------------------------------------------------------------------
 # HELPERS: ACTIONS & TOGGLES
 # ---------------------------------------------------------------------------
+
+function Toggle-Updates {
+    $status = Get-UpdateStatus
+    $regPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU"
+    
+    if ($status.Text -match "ACTIVE") {
+        Write-Host "   [-] Disabling Windows Updates..." -ForegroundColor Yellow
+        
+        # Stop and Disable Windows Update Services
+        Set-Service -Name "wuauserv" -StartupType Disabled -ErrorAction SilentlyContinue
+        Stop-Service -Name "wuauserv" -Force -ErrorAction SilentlyContinue
+        
+        # Set Group Policies via Registry to block updates permanently
+        if (-not (Test-Path $regPath)) { $null = New-Item -Path $regPath -Force -ErrorAction SilentlyContinue }
+        Set-ItemProperty -Path $regPath -Name "NoAutoUpdate" -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue
+        
+        # Prevent delivery optimization bypass from forcing downloads
+        $optPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization"
+        if (-not (Test-Path $optPath)) { $null = New-Item -Path $optPath -Force -ErrorAction SilentlyContinue }
+        Set-ItemProperty -Path $optPath -Name "DODownloadMode" -Value 100 -Type DWord -Force -ErrorAction SilentlyContinue
+        
+        Write-Host "   [OK] Windows Updates disabled." -ForegroundColor Yellow
+    } else {
+        Write-Host "   [+] Enabling Windows Updates..." -ForegroundColor Green
+        
+        # Enable and Start Windows Update Services
+        Set-Service -Name "wuauserv" -StartupType Manual -ErrorAction SilentlyContinue
+        Start-Service -Name "wuauserv" -ErrorAction SilentlyContinue
+        
+        # Clear update block registry policies
+        if (Test-Path $regPath) {
+            Remove-ItemProperty -Path $regPath -Name "NoAutoUpdate" -Force -ErrorAction SilentlyContinue
+        }
+        $optPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization"
+        if (Test-Path $optPath) {
+            Remove-ItemProperty -Path $optPath -Name "DODownloadMode" -Force -ErrorAction SilentlyContinue
+        }
+        
+        Write-Host "   [OK] Windows Updates enabled (Manual)." -ForegroundColor Green
+    }
+    Start-Sleep 2
+}
 
 function Toggle-Registry {
     param ([string]$Path, [string]$Name, [int]$OnValue, [int]$OffValue, [string]$Desc)
@@ -293,7 +456,7 @@ function Toggle-ContextMenu {
                 Write-Host "   [-] Extended CMD Prompts Here Menu removed." -ForegroundColor Yellow 
             } else {
                 foreach ($r in $roots) {
-                    $null = New-Item $r -Force -ErrorAction SilentlyContinue
+                    $null = New-Item r -Force -ErrorAction SilentlyContinue
                     Set-ItemProperty $r -Name "MUIVerb" -Value "Command Prompt" -Force -ErrorAction SilentlyContinue
                     Set-ItemProperty $r -Name "Icon" -Value "cmd.exe" -Force -ErrorAction SilentlyContinue
                     Set-ItemProperty $r -Name "SubCommands" -Value "" -Force -ErrorAction SilentlyContinue
@@ -404,11 +567,21 @@ function Toggle-Store {
 # MAIN LOOP
 # ---------------------------------------------------------------------------
 
+# Cache slow-to-load System Information before starting the UI loop to prevent lag on refreshes
+$cachedOSVersion = Get-WindowsVersion
+$cachedLicenseInfo = Get-LicenseStatus
+
 do {
     Clear-Host
     Write-Host "   ========================================" -ForegroundColor Cyan
-    Write-Host "          WINDOWS LTSC & TWEAK TOOL        " -ForegroundColor White
+    Write-Host "                 WINDOWS TOOL              " -ForegroundColor Cyan
     Write-Host "   ========================================" -ForegroundColor Cyan
+    Write-Host "   OS Version   : " -NoNewline -ForegroundColor White; Write-Host $cachedOSVersion -ForegroundColor Gray
+    Write-Host "   License      : " -NoNewline -ForegroundColor White; Write-Host $cachedLicenseInfo.Status -ForegroundColor $cachedLicenseInfo.Color
+    Write-Host "   Lic. Channel : " -NoNewline -ForegroundColor White; Write-Host $cachedLicenseInfo.Type -ForegroundColor Gray
+    Write-Host "   Product Key  : " -NoNewline -ForegroundColor White; Write-Host $cachedLicenseInfo.Key -ForegroundColor Gray
+    Write-Host "   ========================================" -ForegroundColor Cyan
+    Write-Host ""
 
     # --- PERFORMANCE OPTIMIZATION: Ultra-fast registry reading using .NET ---
     $installedAppsCache = @{}
@@ -487,6 +660,7 @@ do {
     $s = Get-ComponentStatus "Store"; Write-Host "   [S] Microsoft Store (LTSC)    : " -NoNewline; Write-Host $s.Text -ForegroundColor $s.Color
     $s = Get-DefenderStatus; Write-Host "   [D] Windows Defender (RTP)    : " -NoNewline; Write-Host $s.Text -ForegroundColor $s.Color
     $s = Get-MitigationStatus; Write-Host "   [M] CPU Mitigations (Spectre) : " -NoNewline; Write-Host $s.Text -ForegroundColor $s.Color
+    $s = Get-UpdateStatus; Write-Host "   [U] Windows Update (Updates)  : " -NoNewline; Write-Host $s.Text -ForegroundColor $s.Color
 
     Write-Host ""
     Write-Host "   RUNTIMES & FRAMEWORKS" -ForegroundColor Gray
@@ -530,6 +704,7 @@ do {
         { $_ -eq "s" } { Toggle-Store }
         { $_ -eq "d" } { Toggle-Defender }
         { $_ -eq "m" } { Toggle-Mitigations }
+        { $_ -eq "u" } { Toggle-Updates }
 
         # RUNTIMES
         { $_ -eq "r" } { Toggle-App "VC++ Redistributable 2015-2022" "Microsoft.VCRedist.2015+.x64" }
